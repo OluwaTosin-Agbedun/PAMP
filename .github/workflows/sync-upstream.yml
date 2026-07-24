@@ -1,0 +1,86 @@
+name: Sync from Jerry repo
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify required secrets
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+          DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+        run: |
+          if [ -z "$UPSTREAM_TOKEN" ]; then
+            echo "UPSTREAM_TOKEN is missing."
+            exit 1
+          fi
+
+          if [ -z "$DESTINATION_TOKEN" ]; then
+            echo "DESTINATION_TOKEN is missing."
+            exit 1
+          fi
+
+          echo "Required secrets are available."
+
+      - name: Checkout OluwaTosin destination repo
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.DESTINATION_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Clone Jerry source repo
+        run: |
+          rm -rf /tmp/upstream
+
+          git clone \
+            https://x-access-token:${{ secrets.UPSTREAM_TOKEN }}@github.com/TheTechGuyJerry/SPAMP.git \
+            /tmp/upstream
+
+      - name: Copy Jerry repo into OluwaTosin repo
+        run: |
+          mkdir -p /tmp/current-workflow
+
+          cp -f \
+            .github/workflows/sync-upstream.yml \
+            /tmp/current-workflow/sync-upstream.yml || true
+
+          find . \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name .git \
+            -exec rm -rf {} +
+
+          rsync -a \
+            --delete \
+            --exclude='.git' \
+            /tmp/upstream/ ./
+
+          mkdir -p .github/workflows
+
+          cp -f \
+            /tmp/current-workflow/sync-upstream.yml \
+            .github/workflows/sync-upstream.yml || true
+
+      - name: Commit and push to OluwaTosin repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to sync."
+            exit 0
+          fi
+
+          git commit -m "Sync from TheTechGuyJerry/SPAMP"
+          git push origin HEAD:${{ github.ref_name }}
