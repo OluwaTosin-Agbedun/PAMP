@@ -1,0 +1,79 @@
+name: Accessibility
+
+# Release 1.5 §"Accessibility" — "Integrate automated accessibility
+# validation... CI accessibility checks." This is this repository's
+# first CI workflow of any kind; kept deliberately scoped to what the
+# brief asked for (axe-core/WCAG, keyboard navigation, colour contrast —
+# all exercised by tests/e2e/accessibility.spec.ts) rather than standing
+# up a full multi-job pipeline as an unrelated side effect.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  accessibility:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pam_p
+          POSTGRES_PASSWORD: pam_p
+          POSTGRES_DB: pam_p_fms
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://pam_p:pam_p@localhost:5432/pam_p_fms
+      AUTH_SECRET: ci-only-placeholder-secret-not-used-in-production
+      # Isolated bootstrap System Administrator for this job's ephemeral
+      # Postgres service container only (spun up fresh above, destroyed
+      # with the runner — never staging or production). prisma/seed.ts
+      # deliberately refuses to run without these three set, in every
+      # environment including CI; this is what satisfies that check here.
+      # Not a GitHub Actions secret on purpose: it protects nothing (the
+      # database it authenticates against ceases to exist at the end of
+      # this job) — hardcoding a value this obviously non-production,
+      # inline in a public workflow file, is more transparent than
+      # storing it as if it were sensitive. Never reused as a default
+      # anywhere in application code or in .env.example.
+      SEED_ADMIN_NAME: "CI Bootstrap Admin"
+      SEED_ADMIN_EMAIL: "ci-bootstrap-admin@accessibility.test"
+      SEED_ADMIN_PASSWORD: "Ci-Bootstrap-Only-9!"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx prisma migrate deploy
+
+      - run: npx prisma db seed
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - run: npx playwright test tests/e2e/accessibility.spec.ts
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accessibility-results
+          path: |
+            tests/e2e/accessibility-results.json
+            playwright-report/
+            test-results/
+          retention-days: 14

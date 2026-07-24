@@ -1,0 +1,2493 @@
+// PAM-P Fellowship Management System — Version 1.0 database foundation.
+// Phase 0: authentication, RBAC, audit trail.
+// Sequence 1: applicant import, eligibility engine, reviewer assignment.
+// This migration: the complete V1.0 data foundation — scoring, interviews,
+// committee, executive approval, admissions, notes, ranking — approved
+// before any further UI is built. See docs/database.md for the full
+// design document (ERD, rationale, indexing/audit/soft-delete strategy).
+//
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// =============================================================================
+// Programme / Cohort
+// =============================================================================
+
+/// A fellowship programme. V1.0 runs exactly one ("PAM-P"), seeded once —
+/// this table exists so a future second programme is a new row, not a
+/// migration touching every Cohort/Applicant/Application record that
+/// already exists. No programme-switching UI or programme-scoped RBAC in
+/// V1.0; this is a structural placeholder, not a feature.
+model Programme {
+  id       String  @id @default(cuid())
+  name     String
+  slug     String  @unique
+  /// Short administrative code (e.g. "PAM-P-2026") — Release 1.5's
+  /// Configuration Centre requirement. Nullable and unconstrained
+  /// (no uniqueness/format check): existing programmes predate this
+  /// field, and nothing in the codebase keys off it — it is
+  /// display-only administrative metadata, not an identifier anything
+  /// joins or looks up by.
+  code     String?
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cohorts               Cohort[]
+  reviewStages          ReviewStage[]
+  reviewerCapacities    ReviewerCapacity[]
+  interviewerCapacities InterviewerCapacity[]
+  windows               ProgrammeWindow[]
+
+  @@map("programmes")
+}
+
+/// A programme cycle ("PAM-P 2026"). V1.0 runs a single active cohort per
+/// programme; every applicant-facing table hangs off cohortId so a future
+/// cycle — or a bigger one, 5,000+ applicants — is new rows, not a
+/// redesign.
+model Cohort {
+  id          String    @id @default(cuid())
+  programmeId String
+  programme   Programme @relation(fields: [programmeId], references: [id])
+
+  name     String
+  year     Int
+  isActive Boolean @default(true)
+
+  /// Application intake window (Release 1.5 Configuration Centre —
+  /// "Application Opening/Closing Date"). Distinct from the
+  /// "Application Review Window", which is `ReviewStage.opensAt/
+  /// closesAt` on the stage itself (reviewers scoring, not applicants
+  /// applying) — these two windows govern different audiences and were
+  /// kept as separate fields rather than overloaded onto one pair.
+  applicationOpensAt  DateTime?
+  applicationClosesAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  applicants              Applicant[]
+  applications            Application[]
+  importBatches           ImportBatch[]
+  eligibilityCriteria     EligibilityCriterion[]
+  reviewStages            ReviewStage[]
+  interviewCriteria       InterviewCriterion[]
+  interviewQuestions      InterviewQuestion[]
+  interviews              Interview[]
+  applicationScores       ApplicationScore[]
+  rankingSnapshots        RankingSnapshot[]
+  rankingTieResolutions   RankingTieResolution[]
+  windows                 ProgrammeWindow[]
+  interviewerAvailability InterviewerAvailability[]
+
+  @@index([programmeId])
+  @@map("cohorts")
+}
+
+/// A named pipeline-stage date window that has no dedicated schema home
+/// of its own yet (Release 1.5 Configuration Centre — Eligibility
+/// Review, Interview, Executive Approval, and Offer windows). Deliberately
+/// *not* reused for the Application Review window — that one already has
+/// a purpose-built home (`ReviewStage.opensAt/closesAt`, which also
+/// carries scoring configuration `ReviewStage` needs and
+/// `ProgrammeWindow` does not). No module reads these rows yet — the
+/// Interview Engine, Executive Approval, and Admissions/Offer phases are
+/// explicitly out of scope for Release 1.5 (§"Scope Restrictions"); this
+/// table exists so those future phases have real configured dates to
+/// read on day one, instead of another round of "no hardcoded dates"
+/// schema work.
+model ProgrammeWindow {
+  id          String    @id @default(cuid())
+  programmeId String
+  programme   Programme @relation(fields: [programmeId], references: [id])
+  cohortId    String?
+  cohort      Cohort?   @relation(fields: [cohortId], references: [id])
+
+  code     ProgrammeWindowCode
+  opensAt  DateTime?
+  closesAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([programmeId, cohortId, code])
+  @@index([programmeId])
+  @@index([cohortId])
+  @@map("programme_windows")
+}
+
+enum ProgrammeWindowCode {
+  ELIGIBILITY_REVIEW
+  INTERVIEW
+  EXECUTIVE_APPROVAL
+  OFFER
+}
+
+// =============================================================================
+// Identity, RBAC, audit, configuration
+// =============================================================================
+
+/// Every distinct workspace/permission group in the FMS.
+/// FELLOW has no module access until Version 2 (Fellow Portal) — it exists
+/// here now so the RBAC matrix and schema don't need to change when v2 lands.
+///
+/// Phase 3B.1: the single REVIEWER role was split into ELIGIBILITY_REVIEWER
+/// and APPLICATION_REVIEWER to match the approved PAM-P operational role
+/// vocabulary (docs/ROLE_AND_NAVIGATION_RECONCILIATION.md). This reverses a
+/// deliberate Phase 2 decision documented in docs/RBAC.md ("why one REVIEWER
+/// role") — eligibility screening is still fully automatic, so
+/// ELIGIBILITY_REVIEWER is a read-only oversight role, not a new human
+/// review action; see the ADR for the full reasoning and the one open
+/// governance question it leaves.
+enum Role {
+  SYSTEM_ADMIN
+  PROGRAMME_DIRECTOR
+  PROGRAMME_SECRETARY
+  ELIGIBILITY_REVIEWER
+  APPLICATION_REVIEWER
+  INTERVIEWER
+  SELECTION_COMMITTEE_MEMBER
+  EXECUTIVE
+  FELLOW
+}
+
+/// Account lifecycle state. ACTIVE is the only state that can sign in.
+/// PENDING_ACTIVATION exists for a future self-service/invitation flow —
+/// the current admin-creates-with-password flow doesn't use it; new
+/// accounts are created ACTIVE. LOCKED is settable by an administrator
+/// (same action as SUSPENDED) — there is no automatic failed-attempt
+/// lockout in this phase, see docs/AUTHENTICATION.md.
+enum AccountStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING_ACTIVATION
+  LOCKED
+}
+
+/// Staff account. Accounts are provisioned by a System Administrator —
+/// there is no self-service sign-up. `deletedAt` is for genuine account
+/// removal (e.g. a duplicate/mistaken account); day-to-day status changes
+/// use `status` and keep the account visible in admin screens.
+model User {
+  id                 String        @id @default(cuid())
+  name               String
+  email              String        @unique
+  passwordHash       String
+  role               Role
+  status             AccountStatus @default(ACTIVE)
+  /// Forces the change-password flow on next successful login — set on
+  /// account creation and on any administrator-initiated password reset.
+  mustChangePassword Boolean       @default(false)
+  deletedAt          DateTime?
+
+  createdById  String?
+  createdBy    User?   @relation("UserCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdUsers User[]  @relation("UserCreatedBy")
+
+  lastLoginAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  accounts  Account[]
+  sessions  Session[]
+  auditLogs AuditLog[]
+
+  importBatches                 ImportBatch[]
+  reviewAssignments             ReviewAssignment[]
+  reviewAssignmentsAssigned     ReviewAssignment[]         @relation("ReviewAssignmentAssignedBy")
+  reviewAssignmentsCancelled    ReviewAssignment[]         @relation("ReviewAssignmentCancelledBy")
+  reviewAssignmentsReassignedBy ReviewAssignment[]         @relation("ReviewAssignmentReassignedBy")
+  reviewerCapacities            ReviewerCapacity[]
+  conflictsOfInterest           ReviewConflictOfInterest[] @relation("ConflictReviewer")
+  conflictsDeclared             ReviewConflictOfInterest[] @relation("ConflictDeclaredBy")
+  reviews                       Review[]
+  reviewsReopened               Review[]                   @relation("ReviewReopenedBy")
+  reviewFrameworksPublished     ReviewFramework[]          @relation("ReviewFrameworkPublishedBy")
+  reviewFrameworksRetired       ReviewFramework[]          @relation("ReviewFrameworkRetiredBy")
+  interviewPanelist             InterviewPanelist[]
+  interviewScores               InterviewScore[]
+  committeeVotes                CommitteeVote[]
+  committeeDecisions            CommitteeDecision[]        @relation("CommitteeDecisionDecider")
+  executiveApprovals            ExecutiveApproval[]        @relation("ExecutiveApprover")
+  admissionOffersIssued         AdmissionOffer[]           @relation("AdmissionOfferIssuer")
+  notes                         Note[]
+  rankingSnapshots              RankingSnapshot[]
+  rankingSnapshotsApproved      RankingSnapshot[]          @relation("RankingSnapshotApprovedBy")
+  rankingSnapshotsReopened      RankingSnapshot[]          @relation("RankingSnapshotReopenedBy")
+  rankingTieResolutionsResolved RankingTieResolution[]     @relation("RankingTieResolutionResolver")
+  // Executive Approval Data Model (Planning Phase 3)
+  rankingApprovalStagesRecorded RankingApprovalStage[]     @relation("RankingApprovalStageApprover")
+  updatedSettings               SystemSetting[]
+  notifications                 Notification[]
+
+  // Notifications (outbound delivery)
+  notificationTemplatesUpdated   NotificationTemplate[] @relation("NotificationTemplateUpdatedBy")
+  outboundNotificationsReceived  OutboundNotification[] @relation("OutboundNotificationRecipient")
+  outboundNotificationsCancelled OutboundNotification[] @relation("OutboundNotificationCancelledBy")
+  outboundNotificationsCreated   OutboundNotification[] @relation("OutboundNotificationCreatedBy")
+
+  eligibilityRecommendationsRaised   EligibilityRecommendation[] @relation("EligibilityRecommendationsRaised")
+  eligibilityRecommendationsExecuted EligibilityRecommendation[] @relation("EligibilityRecommendationsExecuted")
+
+  eligibilityScreeningsAssigned    EligibilityScreening[]     @relation("EligibilityScreener")
+  eligibilityScreeningsAssignedBy  EligibilityScreening[]     @relation("EligibilityScreenerAssignedBy")
+  eligibilitySecondReviews         EligibilityScreening[]     @relation("EligibilitySecondReviewer")
+  eligibilityDecisionsDecided      EligibilityScreening[]     @relation("EligibilityDecidedBy")
+  eligibilityScreeningsReopened    EligibilityScreening[]     @relation("EligibilityReopenedBy")
+  eligibilityClarificationDeadlinesExtended EligibilityScreening[] @relation("EligibilityClarificationDeadlineExtendedBy")
+  eligibilityChecklistItemsUpdated EligibilityChecklistItem[] @relation("EligibilityChecklistItemUpdatedBy")
+  applicationsWithdrawn            Application[]              @relation("ApplicationWithdrawnBy")
+  applicationDuplicatesResolved    Application[]              @relation("ApplicationDuplicateResolvedBy")
+
+  interviewPanelistsAssignedBy   InterviewPanelist[]           @relation("InterviewPanelistAssignedBy")
+  interviewPanelistsCancelledBy  InterviewPanelist[]           @relation("InterviewPanelistCancelledBy")
+  interviewPanelistsReassignedBy InterviewPanelist[]           @relation("InterviewPanelistReassignedBy")
+  interviewerCapacities          InterviewerCapacity[]
+  interviewConflictsOfInterest   InterviewConflictOfInterest[] @relation("InterviewConflictInterviewer")
+  interviewConflictsDeclaredBy   InterviewConflictOfInterest[] @relation("InterviewConflictDeclaredBy")
+
+  // Interview Scheduling (Release 1 — Enterprise Functional Specification Addendum)
+  interviewerAvailability  InterviewerAvailability[]
+  interviewsTeamsLinkAdded Interview[]               @relation("InterviewTeamsLinkAddedBy")
+  interviewsConfirmed      Interview[]               @relation("InterviewConfirmedBy")
+  interviewsDeclined       Interview[]               @relation("InterviewDeclinedBy")
+  interviewsCancelled      Interview[]               @relation("InterviewCancelledBy")
+
+  // Microsoft Teams Interview Integration
+  interviewTeamsMeetingsCreated   InterviewTeamsMeeting[] @relation("InterviewTeamsMeetingCreatedBy")
+  interviewTeamsMeetingsCancelled InterviewTeamsMeeting[] @relation("InterviewTeamsMeetingCancelledBy")
+
+  // Interview Scoring Revision (Addendum Module 2)
+  interviewsScoringOverrideBy              Interview[] @relation("InterviewScoringOverrideBy")
+  interviewsScoringOverrideMissingPanelist Interview[] @relation("InterviewScoringOverrideMissingPanelist")
+
+  // Interview Questions (Addendum Module 3)
+  interviewsActualStartedBy Interview[]              @relation("InterviewActualStartedBy")
+  interviewsActualEndedBy   Interview[]              @relation("InterviewActualEndedBy")
+  interviewQuestionsAskedBy InterviewQuestionAsked[] @relation("InterviewQuestionAskedBy")
+
+  // Interview Module Completion (Planning Phase 2)
+  interviewsAttendanceRecordedBy Interview[] @relation("InterviewAttendanceRecordedBy")
+
+  @@map("users")
+}
+
+// --- Auth.js-compatible tables -----------------------------------------
+// Credentials login runs on JWT sessions and does not need these tables.
+// They're modeled now so an OAuth provider (Microsoft Entra ID / Google
+// Workspace SSO) can be registered later purely as config, with no schema
+// migration or redesign.
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// --- Audit trail ----------------------------------------------------------
+
+/// Immutable, append-only record of every security- and business-relevant
+/// event in the system (see docs/database.md for the full action
+/// taxonomy). Never updated or deleted — this table IS the audit strategy,
+/// not a supplement to per-entity history fields.
+model AuditLog {
+  id      String  @id @default(cuid())
+  actorId String?
+  actor   User?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  action     String
+  entityType String
+  entityId   String?
+  /// Previous/new value and free-text reason live here (e.g.
+  /// { from, to, reason }) rather than as separate columns — flexible,
+  /// display-only data, not something queries filter/join on.
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String?
+  /// One per HTTP request/Server Action invocation — distinct from
+  /// correlationId below, which can span *multiple* requests that
+  /// together make up one logical action (Release 1.5 §"Audit
+  /// Enhancement"). Generated in lib/audit/context.ts.
+  requestId  String?
+  /// The signed-in session's identifier. Auth.js's JWT strategy has no
+  /// persisted Session row to reference, so this is the session token's
+  /// `jti` (JWT ID) where present — see lib/audit/context.ts for exactly
+  /// how it's derived, and its doc comment for why this is the honest
+  /// available proxy rather than a true server-side session record.
+  sessionId  String?
+
+  /// Denormalized for direct filtering ("all events for this cohort")
+  /// without extracting from metadata. Not a foreign key — audit rows
+  /// must survive the referenced programme/cohort being deleted.
+  programmeId   String?
+  cohortId      String?
+  /// Ties every audit row produced by one request/action together —
+  /// generated in lib/logging and threaded through to both the
+  /// structured logs and this table.
+  correlationId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@index([correlationId])
+  @@index([requestId])
+  @@index([programmeId])
+  @@index([cohortId])
+  @@map("audit_logs")
+}
+
+// --- System configuration --------------------------------------------------
+
+/// Generic key/value store for admin-tunable settings (review score-
+/// divergence threshold, Top 70/60 target sizes, minimum passing scores)
+/// so operational parameters change without a deploy. Typed accessors
+/// live in lib/settings/service.ts. See docs/database.md for the
+/// documented key convention.
+model SystemSetting {
+  key         String   @id
+  value       Json
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+  updatedBy   User?    @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@map("system_settings")
+}
+
+// =============================================================================
+// Applicants & applications
+// =============================================================================
+
+/// Person-level bio data, imported from the applicant portal export.
+/// `deletedAt`: soft delete — an applicant record is never hard-deleted
+/// (audit/compliance value persists even for rejected/withdrawn
+/// candidates), but can be excluded from active views.
+model Applicant {
+  id       String @id @default(cuid())
+  cohortId String
+  cohort   Cohort @relation(fields: [cohortId], references: [id])
+
+  /// The application portal's own ID for this person, when known — the
+  /// key idempotent re-import and the future direct-API integration
+  /// match on.
+  externalRef String?
+
+  firstName     String
+  lastName      String
+  email         String
+  phone         String?
+  gender        String?
+  dateOfBirth   DateTime?
+  stateOfOrigin String?
+  institution   String?
+
+  /// PAM-P 2026 Eligibility Screening Checklist §1 (Nigerian citizenship)
+  /// — the applicant's own declared nationality, importable but never
+  /// sufficient on its own: `evaluateCitizenshipCheck` only ever
+  /// suggests, the screener decides.
+  nationality        String?
+  /// §1 accepted ID types — National ID, Voters Card, International
+  /// Passport, Driver's Licence, or another accepted government-issued
+  /// document; free text, not an enum, since the checklist's own
+  /// accepted-forms list is open-ended ("or other accepted government-
+  /// issued identification").
+  governmentIdType   String?
+  /// Duplicate-detection input (§8.5) alongside email/phone — never
+  /// written to an audit log's metadata (§14/§19: "protection of
+  /// government identification").
+  governmentIdNumber String?
+
+  nyscStatus         NyscStatus @default(NOT_RECORDED)
+  /// Only meaningful when `nyscStatus = COMPLETED` — the five-year rule
+  /// (§4) needs an exact date, not a loose year comparison.
+  nyscCompletionDate DateTime?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  application           Application?
+  outboundNotifications OutboundNotification[]
+
+  @@unique([cohortId, email])
+  @@unique([cohortId, externalRef])
+  @@index([cohortId])
+  @@map("applicants")
+}
+
+/// PAM-P 2026 Eligibility Screening Checklist §3 — NOT_RECORDED (the
+/// default) is deliberately distinct from any "fail" state: an
+/// applicant imported before this field existed, or whose source column
+/// wasn't mapped, has *no data*, not a *negative* one — automatic
+/// pre-checks must send that straight to Clarify, never Fail.
+enum NyscStatus {
+  NOT_RECORDED
+  COMPLETED
+  CURRENTLY_SERVING
+  EXEMPTED
+  EXCLUDED
+}
+
+enum ApplicationStage {
+  IMPORTED
+  UNDER_REVIEW
+  INTERVIEW
+  COMMITTEE_REVIEW
+  EXECUTIVE_APPROVAL
+  ADMISSIONS
+  CLOSED
+}
+
+/// PENDING covers both "not yet screened" and "screening in progress but
+/// undecided" — everything outside eligibility screening only ever needs
+/// to know "can this proceed or not," so the finer-grained workflow
+/// state (assigned, in progress, escalated...) lives on
+/// `EligibilityScreening.status` instead, not here. Added
+/// `CLARIFICATION_REQUIRED`/`DISQUALIFIED` for the PAM-P 2026 Eligibility
+/// Screening Checklist's 4-decision model — additive, every existing
+/// consumer (applicants list filter, ranking eligibility, Review
+/// Operations) keeps working against `ELIGIBLE`/`INELIGIBLE`/`PENDING`
+/// unchanged.
+enum EligibilityStatus {
+  PENDING
+  ELIGIBLE
+  INELIGIBLE
+  CLARIFICATION_REQUIRED
+  DISQUALIFIED
+}
+
+/// The submission itself: pipeline position, automatic eligibility
+/// outcome, and the free-form data the fixed applicant columns don't
+/// cover (essay answers, programme-specific questions).
+model Application {
+  id          String    @id @default(cuid())
+  applicantId String    @unique
+  applicant   Applicant @relation(fields: [applicantId], references: [id], onDelete: Cascade)
+  cohortId    String
+  cohort      Cohort    @relation(fields: [cohortId], references: [id])
+
+  pathway      String?
+  /// Non-core imported columns, keyed by source column header.
+  essayAnswers Json?
+  /// The raw imported row, verbatim, for traceability back to the source file.
+  rawImportRow Json?
+
+  stage             ApplicationStage  @default(IMPORTED)
+  eligibilityStatus EligibilityStatus @default(PENDING)
+
+  /// PAM-P 2026 Eligibility Screening Checklist §4 ("Application
+  /// submitted within deadline") — the applicant portal's own recorded
+  /// submission time, distinct from `createdAt` (when this system
+  /// imported the row, which can happen long after the applicant
+  /// actually submitted). Compared against `Cohort.applicationClosesAt`
+  /// (already exists — reused, not duplicated) rather than a new
+  /// deadline setting.
+  submittedAt          DateTime?
+  /// §10 Programme Availability — the applicant's own declared ability
+  /// to complete Online Academy/assignments/mentorship/residential.
+  /// Null: no declaration on record (→ Clarify). Not a scoring input.
+  availabilityDeclared Boolean?
+
+  /// A staff-recorded withdrawal (the applicant emailed to withdraw,
+  /// etc.) — distinct from `deletedAt` (a system-level soft delete).
+  /// The record stays fully visible and un-deleted; only progression is
+  /// blocked.
+  isWithdrawn     Boolean   @default(false)
+  withdrawnAt     DateTime?
+  withdrawnById   String?
+  withdrawnBy     User?     @relation("ApplicationWithdrawnBy", fields: [withdrawnById], references: [id], onDelete: SetNull)
+  withdrawnReason String?
+
+  /// §8.5 Duplicate Applications — self-relation rather than a separate
+  /// table: "flag, don't delete, retain one, preserve the other for
+  /// audit" is exactly a pointer plus a resolution record, not a new
+  /// entity shape.
+  duplicateOfId           String?
+  duplicateOf             Application?  @relation("ApplicationDuplicateOf", fields: [duplicateOfId], references: [id])
+  duplicateApplications   Application[] @relation("ApplicationDuplicateOf")
+  duplicateResolvedById   String?
+  duplicateResolvedBy     User?         @relation("ApplicationDuplicateResolvedBy", fields: [duplicateResolvedById], references: [id], onDelete: SetNull)
+  duplicateResolvedAt     DateTime?
+  duplicateResolutionNote String?
+
+  importBatchId String?
+  importBatch   ImportBatch? @relation(fields: [importBatchId], references: [id])
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  documents                    ApplicationDocument[]
+  eligibilityDecisions         EligibilityDecision[]
+  eligibilityRecommendations   EligibilityRecommendation[]
+  eligibilityScreening         EligibilityScreening?
+  interviewConflictsOfInterest InterviewConflictOfInterest[]
+  reviewAssignments            ReviewAssignment[]
+  reviews                      Review[]
+  conflictsOfInterest          ReviewConflictOfInterest[]
+  escalations                  ReviewEscalation[]
+  applicationScore             ApplicationScore?
+  interviews                   Interview[]
+  committeeVotes               CommitteeVote[]
+  committeeDecision            CommitteeDecision?
+  executiveApproval            ExecutiveApproval?
+  admissionOffer               AdmissionOffer?
+  notes                        Note[]
+  rankingSnapshotEntries       RankingSnapshotEntry[]
+  rankingTieResolutionEntries  RankingTieResolutionApplication[]
+
+  @@index([cohortId, stage])
+  @@index([cohortId, eligibilityStatus])
+  @@index([cohortId, createdAt])
+  @@index([duplicateOfId])
+  @@map("applications")
+}
+
+/// Storage-agnostic pointer — swapping the storage provider later is a
+/// config change to whatever resolves storageKey, not a schema change.
+model ApplicationDocument {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  type       String
+  fileName   String
+  storageKey String
+
+  uploadedAt DateTime @default(now())
+
+  @@index([applicationId])
+  @@map("application_documents")
+}
+
+// --- Import ------------------------------------------------------------------
+
+enum ImportBatchStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+/// One row per admin-run import. Column mapping is stored so the exact
+/// mapping used for a given file is auditable and reusable. Never
+/// deleted — this is the provenance record for every imported applicant.
+model ImportBatch {
+  id       String @id @default(cuid())
+  cohortId String
+  cohort   Cohort @relation(fields: [cohortId], references: [id])
+
+  fileName      String
+  uploadedById  String
+  uploadedBy    User   @relation(fields: [uploadedById], references: [id])
+  columnMapping Json
+
+  totalRows    Int
+  successCount Int               @default(0)
+  errorCount   Int               @default(0)
+  status       ImportBatchStatus @default(PROCESSING)
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  applications Application[]
+  rowErrors    ImportRowError[]
+
+  @@index([cohortId, createdAt])
+  @@map("import_batches")
+}
+
+/// A row that failed validation — kept with its raw data and the reason,
+/// so the admin gets a specific, correctable error report rather than a
+/// pass/fail count.
+model ImportRowError {
+  id            String      @id @default(cuid())
+  importBatchId String
+  importBatch   ImportBatch @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+
+  rowNumber    Int
+  rawData      Json
+  errorMessage String
+
+  @@index([importBatchId])
+  @@map("import_row_errors")
+}
+
+// --- Eligibility engine --------------------------------------------------
+
+enum CriterionOperator {
+  EQUALS
+  NOT_EQUALS
+  GREATER_THAN_OR_EQUAL
+  LESS_THAN_OR_EQUAL
+  IN
+  EXISTS
+  REGEX
+}
+
+/// An admin-configurable eligibility rule. `field` must be one of the
+/// whitelisted keys in modules/eligibility/fields.ts — adding a new RULE
+/// (any combination of existing fields/operators/values) never needs a
+/// deploy; adding a new FIELD TYPE does.
+model EligibilityCriterion {
+  id       String @id @default(cuid())
+  cohortId String
+  cohort   Cohort @relation(fields: [cohortId], references: [id])
+
+  label       String
+  description String?
+  field       String
+  operator    CriterionOperator
+  value       Json
+
+  isActive Boolean @default(true)
+  order    Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cohortId, isActive])
+  @@map("eligibility_criteria")
+}
+
+/// The automatic verdict for one application, with an itemized reason
+/// per criterion — this is what "explaining every eligibility decision"
+/// renders in the UI, independent of the generic AuditLog entry also
+/// written for the same event. Never deleted — each evaluation is a new
+/// row, forming a full history of decisions if rules change over time.
+model EligibilityDecision {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  isEligible    Boolean
+  /// [{ criterionId, label, passed, detail }]
+  reasons       Json
+  engineVersion Int      @default(1)
+  evaluatedAt   DateTime @default(now())
+
+  @@index([applicationId])
+  @@map("eligibility_decisions")
+}
+
+/// Release 1.5 §"Governance Resolution" — the Eligibility Reviewer QA
+/// role's one write action: flagging an automated eligibility outcome
+/// and recommending a different result. Never mutates
+/// `Application.eligibilityStatus` itself — see
+/// docs/ELIGIBILITY_QA_GOVERNANCE.md. Only a Programme Secretariat
+/// account can move a row from PENDING to EXECUTED (applying the
+/// override) or DISMISSED (declining it); the Eligibility Reviewer who
+/// raised it can do neither.
+model EligibilityRecommendation {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  raisedById String
+  raisedBy   User   @relation("EligibilityRecommendationsRaised", fields: [raisedById], references: [id])
+
+  /// What the automated engine decided, captured at flag time — so the
+  /// recommendation record stays meaningful even if the application's
+  /// status later changes for an unrelated reason.
+  currentIsEligible     Boolean
+  recommendedIsEligible Boolean
+  reason                String
+
+  status RecommendationStatus @default(PENDING)
+
+  executedById  String?
+  executedBy    User?     @relation("EligibilityRecommendationsExecuted", fields: [executedById], references: [id], onDelete: SetNull)
+  executedAt    DateTime?
+  executionNote String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([applicationId])
+  @@index([status])
+  @@map("eligibility_recommendations")
+}
+
+enum RecommendationStatus {
+  PENDING
+  EXECUTED
+  DISMISSED
+}
+
+// =============================================================================
+// Eligibility Screening (PAM-P 2026 Eligibility Screening Checklist)
+// =============================================================================
+
+/// The screening workflow's own state — deliberately separate from
+/// `Application.eligibilityStatus` (which every other module already
+/// reads and only needs the coarse "can this proceed" answer).
+/// `PENDING_SCREENING`/`IN_PROGRESS` both map to
+/// `EligibilityStatus.PENDING` outside this module.
+enum ScreeningStatus {
+  PENDING_SCREENING
+  IN_PROGRESS
+  CLARIFICATION_REQUIRED
+  ESCALATED
+  ELIGIBLE
+  INELIGIBLE
+  DISQUALIFIED
+}
+
+enum ScreeningNextAction {
+  PROCEED
+  CLARIFY
+  REJECT
+  ESCALATE
+}
+
+/// One checklist row's recorded result. `PASS`/`FAIL`/`CLARIFY` are used
+/// by the Required Documents and Baseline Eligibility sections;
+/// `CLEAR`/`FLAG`/`CLARIFY` by the Consistency and Integrity section —
+/// one enum covers both rather than two near-identical ones, since which
+/// three values are *offered* for a given item is a UI concern
+/// (`checklistDefinition.ts`), not a data-modelling one.
+enum ChecklistItemStatus {
+  PASS
+  FAIL
+  CLARIFY
+  CLEAR
+  FLAG
+}
+
+enum ChecklistSection {
+  DOCUMENT
+  BASELINE
+  INTEGRITY
+}
+
+/// Stage 1 of the fellowship-selection process — not scored. One row
+/// per `Application`, created (as `PENDING_SCREENING`) the moment an
+/// application enters the cohort rather than left implicit, so "has
+/// this ever been screened" is a row's existence, not an inferred
+/// absence. `EligibilityDecision` (the old automatic-engine log) and
+/// this model coexist: the automatic engine's criteria, where
+/// configured, feed `EligibilityChecklistItem`'s automatic pre-checks
+/// (`isAutomatic: true`) rather than writing `Application.eligibilityStatus`
+/// directly — see modules/eligibility/automaticPreChecks.ts.
+model EligibilityScreening {
+  id            String      @id @default(cuid())
+  applicationId String      @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  status ScreeningStatus @default(PENDING_SCREENING)
+
+  screenerId   String?
+  screener     User?     @relation("EligibilityScreener", fields: [screenerId], references: [id], onDelete: SetNull)
+  assignedById String?
+  assignedBy   User?     @relation("EligibilityScreenerAssignedBy", fields: [assignedById], references: [id], onDelete: SetNull)
+  assignedAt   DateTime?
+
+  dateReviewed DateTime?
+  nextAction   ScreeningNextAction?
+
+  reasonForDecision        String?
+  outstandingClarification String?
+  integrityNote            String?
+
+  secondReviewRequired    Boolean   @default(false)
+  secondReviewerId        String?
+  secondReviewer          User?     @relation("EligibilitySecondReviewer", fields: [secondReviewerId], references: [id], onDelete: SetNull)
+  secondReviewCompletedAt DateTime?
+  secondReviewNote        String?
+
+  decidedById String?
+  decidedBy   User?     @relation("EligibilityDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+  decidedAt   DateTime?
+
+  reopenedById String?
+  reopenedBy   User?     @relation("EligibilityReopenedBy", fields: [reopenedById], references: [id], onDelete: SetNull)
+  reopenedAt   DateTime?
+  reopenReason String?
+
+  /// Set the moment `status` becomes `CLARIFICATION_REQUIRED` (default
+  /// window: `eligibility.clarification_deadline_hours`), cleared the
+  /// moment it leaves that status for any reason. A missed deadline is
+  /// enforced by `checkMissedClarificationDeadlines`, an external-
+  /// scheduler-triggered job (see `app/api/cron/process-notifications`),
+  /// not by anything client-side.
+  clarificationDeadlineAt DateTime?
+
+  clarificationDeadlineExtendedById String?
+  clarificationDeadlineExtendedBy   User?     @relation("EligibilityClarificationDeadlineExtendedBy", fields: [clarificationDeadlineExtendedById], references: [id], onDelete: SetNull)
+  clarificationDeadlineExtendedAt   DateTime?
+  clarificationDeadlineExtensionReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  checklistItems EligibilityChecklistItem[]
+
+  @@index([status])
+  @@map("eligibility_screenings")
+}
+
+/// One checklist row. `isAutomatic` distinguishes a system-pre-populated
+/// suggestion (§11.1, never authoritative on its own) from a screener's
+/// own entry — flips to `false` the moment a screener saves over it, so
+/// the UI never has to guess which is which from `updatedById` alone
+/// (an automatic check has no `updatedById`).
+model EligibilityChecklistItem {
+  id          String               @id @default(cuid())
+  screeningId String
+  screening   EligibilityScreening @relation(fields: [screeningId], references: [id], onDelete: Cascade)
+
+  section ChecklistSection
+  /// A key from checklistDefinition.ts (e.g. "CV", "NIGERIAN_CITIZEN",
+  /// "NAME_CONSISTENCY") — not a free string, though not FK-enforced
+  /// either, since the checklist itself is code-defined, not
+  /// database-configurable (docs/RBAC.md's "central catalogue, not rows"
+  /// pattern, applied here too).
+  itemKey String
+
+  status      ChecklistItemStatus?
+  comment     String?
+  isAutomatic Boolean              @default(false)
+
+  updatedById String?
+  updatedBy   User?    @relation("EligibilityChecklistItemUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  updatedAt   DateTime @updatedAt
+
+  @@unique([screeningId, section, itemKey])
+  @@map("eligibility_checklist_items")
+}
+
+// =============================================================================
+// Reviewer workspace — assignment, blind dual review, scoring
+// =============================================================================
+
+enum ReviewSlot {
+  FIRST
+  SECOND
+  THIRD
+}
+
+enum AssignmentMethod {
+  AUTO
+  MANUAL
+}
+
+/// The assignment lifecycle (Phase 3B §5). PENDING is reserved for a
+/// future notification-gated flow — no code path in this phase produces
+/// it, since an assignment is created with a reviewer already chosen and
+/// there's no separate "proposed but not yet assigned" step without a
+/// notification system (out of scope, §18). ESCALATED applies to the
+/// FIRST/SECOND assignments of a pair whose divergence triggered a third
+/// review (see docs/THIRD_REVIEW_ENGINE.md); COMPLETED is the terminal
+/// state for a pair that needed no escalation, or for any assignment
+/// once its application's review is fully resolved.
+enum AssignmentStatus {
+  PENDING
+  ASSIGNED
+  ACCEPTED
+  IN_PROGRESS
+  SUBMITTED
+  ESCALATED
+  REASSIGNED
+  CANCELLED
+  COMPLETED
+}
+
+/// Which reviewer is responsible for which application, and in which
+/// slot. Deliberately separate from Review: routing and scoring are
+/// different concerns, and blind-review enforcement reads this table to
+/// know who is *allowed* to see a given Review row — a reviewer's
+/// repository query is scoped to `reviewerId = session.user.id`, never to
+/// "all reviews for this application."
+///
+/// No `@@unique([applicationId, slot])` — reassignment (§10) creates a
+/// new row for the new reviewer while preserving the old row exactly as
+/// it was (status REASSIGNED), so two rows can legitimately share an
+/// (applicationId, slot) as long as at most one is *active*. That's
+/// enforced instead by a partial unique index in this phase's migration
+/// (`WHERE status NOT IN ('REASSIGNED', 'CANCELLED')`), which Prisma's
+/// declarative schema can't express — see docs/REVIEW_ASSIGNMENT_ENGINE.md.
+model ReviewAssignment {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  reviewerId    String
+  reviewer      User        @relation(fields: [reviewerId], references: [id])
+
+  slot           ReviewSlot
+  assignedMethod AssignmentMethod @default(AUTO)
+  assignedAt     DateTime         @default(now())
+  /// Null for AUTO (system-triggered, no human actor — same pattern as
+  /// eligibility's automatic assignment). Set for MANUAL.
+  assignedById   String?
+  assignedBy     User?            @relation("ReviewAssignmentAssignedBy", fields: [assignedById], references: [id], onDelete: SetNull)
+
+  status     AssignmentStatus @default(ASSIGNED)
+  acceptedAt DateTime?
+
+  cancelledAt   DateTime?
+  cancelledById String?
+  cancelledBy   User?     @relation("ReviewAssignmentCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  cancelReason  String?
+
+  /// Reassignment (§10): this row is what a reassignment *replaces* —
+  /// set on the OLD row, pointing at nothing; the NEW row (created by
+  /// the reassignment) sets `reassignedFromId` pointing back at this
+  /// one. `@unique` because an old assignment is reassigned into exactly
+  /// one new row at a time (re-reassigning it again later creates a
+  /// third row pointing at the second, chaining rather than branching).
+  reassignedFromId String?           @unique
+  reassignedFrom   ReviewAssignment? @relation("ReviewAssignmentReassignment", fields: [reassignedFromId], references: [id])
+  reassignedTo     ReviewAssignment? @relation("ReviewAssignmentReassignment")
+  reassignedAt     DateTime?
+  reassignedById   String?
+  reassignedBy     User?             @relation("ReviewAssignmentReassignedBy", fields: [reassignedById], references: [id], onDelete: SetNull)
+  reassignReason   String?
+
+  review            Review?
+  escalationAsThird ReviewEscalation? @relation("EscalationThirdAssignment")
+
+  @@index([reviewerId])
+  @@index([applicationId, slot])
+  @@map("review_assignments")
+}
+
+/// A reviewer's capacity/availability, scoped to one programme (required
+/// — V1.0 runs a single programme, so "applies to every programme" via a
+/// nullable wildcard isn't needed yet; a second programme is a second
+/// row per reviewer, not a schema change). No row for a reviewer means
+/// the configurable default applies (`lib/settings/service.ts`) and
+/// `isAvailable` defaults to `true` — capacity rows are opt-in
+/// overrides, not a required provisioning step for every reviewer.
+model ReviewerCapacity {
+  id          String    @id @default(cuid())
+  reviewerId  String
+  reviewer    User      @relation(fields: [reviewerId], references: [id])
+  programmeId String
+  programme   Programme @relation(fields: [programmeId], references: [id])
+
+  maxConcurrentAssignments Int       @default(10)
+  isAvailable              Boolean   @default(true)
+  unavailableReason        String?
+  unavailableUntil         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([reviewerId, programmeId])
+  @@map("reviewer_capacities")
+}
+
+enum ConflictSource {
+  SELF_DECLARED
+  ADMIN_RECORDED
+}
+
+/// A reviewer never receives an assignment for an application they have
+/// a recorded conflict against — enforced at assignment-selection time,
+/// not just displayed. Scoped to `Application`, not `Applicant`: V1.0's
+/// `Applicant`/`Application` relationship is a strict 1:1
+/// (`docs/database.md`), so the two are currently equivalent, but this
+/// keeps the model honest about which one V1.0 actually needs — a future
+/// "applicant reapplies in a later cohort" case would need its own
+/// conflict row anyway, since a new cohort means a new Application.
+model ReviewConflictOfInterest {
+  id            String      @id @default(cuid())
+  reviewerId    String
+  reviewer      User        @relation("ConflictReviewer", fields: [reviewerId], references: [id])
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  reason       String
+  source       ConflictSource
+  declaredById String
+  declaredBy   User           @relation("ConflictDeclaredBy", fields: [declaredById], references: [id])
+
+  /// Null = permanent. Set for a time-boxed conflict (e.g. "on leave from
+  /// this cohort's review only").
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@unique([reviewerId, applicationId])
+  @@index([applicationId])
+  @@map("review_conflicts_of_interest")
+}
+
+/// One record per detected Reviewer-1/Reviewer-2 divergence exceeding
+/// the configured threshold — created the moment the second of the pair
+/// submits, whether or not a third reviewer could immediately be found
+/// (`thirdReviewAssignmentId` stays null until one is). `resolvedFinalScore`
+/// is set once the third review submits, per the §2 formula (average of
+/// the third reviewer's score and the lower of the first two) — see
+/// docs/THIRD_REVIEW_ENGINE.md. Deliberately does not write to
+/// `ApplicationScore`; that table's sole writer is Sequence 3's
+/// `ScoreAggregationService`, unbuilt and out of scope this phase.
+model ReviewEscalation {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  firstReviewId  String
+  firstReview    Review @relation("EscalationFirstReview", fields: [firstReviewId], references: [id])
+  secondReviewId String
+  secondReview   Review @relation("EscalationSecondReview", fields: [secondReviewId], references: [id])
+
+  scoreDifference  Decimal @db.Decimal(6, 2)
+  thresholdApplied Decimal @db.Decimal(6, 2)
+
+  thirdReviewAssignmentId String?           @unique
+  thirdReviewAssignment   ReviewAssignment? @relation("EscalationThirdAssignment", fields: [thirdReviewAssignmentId], references: [id])
+
+  resolvedFinalScore Decimal?  @db.Decimal(6, 2)
+  resolvedAt         DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([applicationId, firstReviewId, secondReviewId])
+  @@map("review_escalations")
+}
+
+// =============================================================================
+// Review framework & scoring engine (Phase 3A)
+//
+// A ReviewStage is a configurable slot in the selection pipeline
+// ("Application Review, worth up to 60"). A ReviewFramework is one
+// versioned rubric that fills that slot at a point in time — multiple
+// versions can exist for a stage; publishing a new one retires the
+// previous PUBLISHED version for the same stage (service-enforced, see
+// docs/REVIEW_FRAMEWORK.md), so "the active framework" for a stage is
+// unambiguous. A framework's ReviewCriterion rows are immutable once the
+// framework is PUBLISHED — a rubric change is a new framework version,
+// never an edit in place. This is what makes `Review.reviewFrameworkId`
+// a durable pointer to "exactly the rubric this review was scored
+// against," even after later framework versions exist.
+//
+// Deliberately does NOT add createdById/updatedById to ReviewStage or
+// ReviewCriterion (unlike ReviewFramework's publishedBy/retiredBy,
+// which are lifecycle-defining, not just "who last edited this row") —
+// consistent with the existing project convention (EligibilityCriterion
+// has no actor columns either) that the AuditLog is the single history
+// mechanism, not a per-entity supplement. See docs/database.md §8.
+// =============================================================================
+
+enum ReviewStageStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+}
+
+/// A configurable point in the selection pipeline that can carry its own
+/// scoring rubric (Application Review, Interview, Committee Assessment).
+/// `cohortId` is nullable: null applies the stage to every cohort under
+/// the programme; set scopes it to one cohort's own configuration.
+/// No `deletedAt` — same reasoning as ReviewCriterion below: `status =
+/// RETIRED` is "turned off without disappearing from history," and a
+/// second deletion mechanism on top of that would be redundant.
+model ReviewStage {
+  id          String    @id @default(cuid())
+  programmeId String
+  programme   Programme @relation(fields: [programmeId], references: [id])
+  cohortId    String?
+  cohort      Cohort?   @relation(fields: [cohortId], references: [id])
+
+  name        String
+  code        String
+  description String?
+
+  maxTotalScore Decimal           @db.Decimal(6, 2)
+  status        ReviewStageStatus @default(DRAFT)
+  sequenceOrder Int               @default(0)
+
+  opensAt  DateTime?
+  closesAt DateTime?
+
+  /// Whether Review.comments (the overall review comment) is required at
+  /// submission — distinct from ReviewCriterion.isCommentMandatory,
+  /// which governs a comment on one criterion's score.
+  commentsRequired     Boolean @default(false)
+  /// When true, every active criterion in this stage's framework is
+  /// mandatory for submission regardless of its own isMandatory value —
+  /// a stage-wide override for "nothing is optional here." When false,
+  /// each criterion's own isMandatory flag governs individually.
+  allCriteriaMandatory Boolean @default(true)
+  allowPartialDraft    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  frameworks ReviewFramework[]
+
+  @@unique([programmeId, cohortId, code])
+  @@index([programmeId, cohortId])
+  @@map("review_stages")
+}
+
+enum ReviewFrameworkStatus {
+  DRAFT
+  PUBLISHED
+  RETIRED
+}
+
+/// The one scoring formula this codebase implements today. Modeled as an
+/// enum on the framework (not hardcoded) so a future method — the brief
+/// mentions percentage-normalised scoring as a hypothetical — is a new
+/// case in the calculation service's dispatch, not a rewrite of the
+/// review/criterion model. WEIGHTED_SUM covers both "weighted" and
+/// "unweighted" scoring: an unweighted framework is just every
+/// criterion's weight left at its default of 1.
+enum ReviewScoringMethod {
+  WEIGHTED_SUM
+}
+
+/// One versioned rubric implementing a ReviewStage. Never mutated after
+/// publish — see the section comment above. `totalConfiguredScore` is
+/// computed and cached at publish time (sum of maxScore × weight across
+/// active criteria); it's what publish-validation checks against
+/// `reviewStage.maxTotalScore`.
+model ReviewFramework {
+  id            String      @id @default(cuid())
+  reviewStageId String
+  reviewStage   ReviewStage @relation(fields: [reviewStageId], references: [id])
+  /// Denormalized from reviewStage — same "written once, never
+  /// independently updated" pattern as Application.cohortId.
+  programmeId   String
+  cohortId      String?
+
+  version              Int
+  status               ReviewFrameworkStatus @default(DRAFT)
+  scoringMethod        ReviewScoringMethod   @default(WEIGHTED_SUM)
+  effectiveAt          DateTime?
+  totalConfiguredScore Decimal?              @db.Decimal(6, 2)
+
+  publishedById String?
+  publishedBy   User?     @relation("ReviewFrameworkPublishedBy", fields: [publishedById], references: [id], onDelete: SetNull)
+  publishedAt   DateTime?
+
+  retiredById String?
+  retiredBy   User?     @relation("ReviewFrameworkRetiredBy", fields: [retiredById], references: [id], onDelete: SetNull)
+  retiredAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  criteria     ReviewCriterion[]
+  ratingScales RatingScale[]
+  reviews      Review[]
+
+  @@unique([reviewStageId, version])
+  @@index([reviewStageId, status])
+  @@map("review_frameworks")
+}
+
+/// A reusable, named set of labeled score bands (e.g. 1 = "Does not meet
+/// expectations" … 5 = "Exceptional"). Framework-scoped, not global — a
+/// scale is part of the versioned rubric it belongs to, frozen the same
+/// way criteria are once the framework is published. Not every criterion
+/// uses one: `ReviewCriterion.ratingScaleId` is nullable, for a
+/// direct-entry score within [minScore, maxScore] instead.
+model RatingScale {
+  id                String          @id @default(cuid())
+  reviewFrameworkId String
+  reviewFramework   ReviewFramework @relation(fields: [reviewFrameworkId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bands    RatingScaleBand[]
+  criteria ReviewCriterion[]
+
+  @@map("rating_scales")
+}
+
+model RatingScaleBand {
+  id            String      @id @default(cuid())
+  ratingScaleId String
+  ratingScale   RatingScale @relation(fields: [ratingScaleId], references: [id], onDelete: Cascade)
+
+  value               Decimal @db.Decimal(6, 2)
+  label               String
+  description         String?
+  behavioralAnchor    String?
+  evidenceExpectation String?
+  displayOrder        Int     @default(0)
+
+  @@unique([ratingScaleId, value])
+  @@map("rating_scale_bands")
+}
+
+/// One rubric line item within a specific ReviewFramework version.
+/// Immutable once its framework is PUBLISHED. `isActive` only has effect
+/// while the framework is still DRAFT — once published, retiring a
+/// single criterion isn't a supported operation; the whole framework
+/// version is superseded by a new one instead (see the section comment
+/// above and docs/REVIEW_FRAMEWORK.md).
+model ReviewCriterion {
+  id                String          @id @default(cuid())
+  reviewFrameworkId String
+  reviewFramework   ReviewFramework @relation(fields: [reviewFrameworkId], references: [id], onDelete: Cascade)
+
+  code        String
+  label       String
+  description String?
+
+  reviewerGuidance String?
+  evidenceGuidance String?
+
+  displayOrder Int @default(0)
+
+  minScore Decimal @default(0) @db.Decimal(6, 2)
+  maxScore Decimal @db.Decimal(6, 2)
+  weight   Decimal @default(1) @db.Decimal(6, 2)
+
+  isMandatory        Boolean @default(true)
+  isCommentMandatory Boolean @default(false)
+  allowDecimalScores Boolean @default(true)
+  isActive           Boolean @default(true)
+
+  ratingScaleId String?
+  ratingScale   RatingScale? @relation(fields: [ratingScaleId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scores ReviewScore[]
+
+  @@unique([reviewFrameworkId, code])
+  @@index([reviewFrameworkId, isActive])
+  @@map("review_criteria")
+}
+
+/// Still used by InterviewScore (Phase 3A doesn't touch the Interview
+/// module) — Review.status moved to the richer ReviewStatus enum below,
+/// specific to what the review lifecycle needs (§11).
+enum ScoreSubmissionStatus {
+  DRAFT
+  SUBMITTED
+  /// Reviewer/panelist declared a conflict of interest — triggers
+  /// reassignment rather than scoring.
+  RECUSED
+}
+
+/// NOT_STARTED → IN_PROGRESS → SUBMITTED is the normal path; SUBMITTED →
+/// REOPENED → SUBMITTED handles a controlled correction. RECUSED and
+/// CANCELLED are terminal, off the normal path (conflict-of-interest
+/// declaration; administrative cancellation). See
+/// docs/REVIEW_LIFECYCLE.md for the full transition table and what
+/// triggers each one.
+enum ReviewStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  SUBMITTED
+  REOPENED
+  RECUSED
+  CANCELLED
+}
+
+/// One reviewer's evaluation of one application — the actual work
+/// product behind a ReviewAssignment. `applicationId`/`reviewerId` are
+/// denormalized from the assignment (same pattern as Application's
+/// cohortId from Applicant) so the hot paths — "my assigned queue," "all
+/// reviews for this application" for aggregation — don't need a join,
+/// and blind-review enforcement can index directly on reviewerId.
+/// `reviewFrameworkId` pins the exact rubric version this review was (or
+/// is being) scored against — see the section comment above.
+model Review {
+  id                 String           @id @default(cuid())
+  reviewAssignmentId String           @unique
+  reviewAssignment   ReviewAssignment @relation(fields: [reviewAssignmentId], references: [id], onDelete: Cascade)
+  applicationId      String
+  application        Application      @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  reviewerId         String
+  reviewer           User             @relation(fields: [reviewerId], references: [id])
+  reviewFrameworkId  String
+  reviewFramework    ReviewFramework  @relation(fields: [reviewFrameworkId], references: [id])
+
+  status             ReviewStatus @default(NOT_STARTED)
+  totalScore         Decimal?     @db.Decimal(6, 2)
+  comments           String?
+  conflictOfInterest Boolean      @default(false)
+  submittedAt        DateTime?
+
+  /// Reopening fields — all three are set together, by
+  /// reopenReview(), never independently. Preserving "what the prior
+  /// submitted state was" is handled via the audit trail (a snapshot of
+  /// scores/total in the REVIEW_REOPENED entry's metadata), not a second
+  /// copy of the scores in the schema — see docs/REVIEW_LIFECYCLE.md.
+  reopenedAt   DateTime?
+  reopenedById String?
+  reopenedBy   User?     @relation("ReviewReopenedBy", fields: [reopenedById], references: [id], onDelete: SetNull)
+  reopenReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scores              ReviewScore[]
+  escalationsAsFirst  ReviewEscalation[] @relation("EscalationFirstReview")
+  escalationsAsSecond ReviewEscalation[] @relation("EscalationSecondReview")
+
+  @@index([applicationId])
+  @@index([reviewerId, status])
+  @@index([reviewFrameworkId])
+  @@map("reviews")
+}
+
+/// Never a JSON blob — one row per (review, criterion), so averages,
+/// rankings, and reporting are SQL aggregates, not application-layer
+/// JSON parsing. Traceable to the scorer and framework version via
+/// `review` (reviewerId, reviewFrameworkId); to "the criterion
+/// configuration used" via `criterion`, which is itself immutable once
+/// its framework is published.
+model ReviewScore {
+  id          String          @id @default(cuid())
+  reviewId    String
+  review      Review          @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  criterionId String
+  criterion   ReviewCriterion @relation(fields: [criterionId], references: [id])
+
+  score   Decimal @db.Decimal(6, 2)
+  comment String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([reviewId, criterionId])
+  @@map("review_scores")
+}
+
+// =============================================================================
+// Score aggregation & ranking
+// =============================================================================
+
+enum RankingTier {
+  TOP_70
+  TOP_60
+  RESERVE
+  NOT_RANKED
+}
+
+/// The single source of truth for "where does this application currently
+/// stand" — written only by ScoreAggregationService, read by every
+/// dashboard/list/report. Kept separate from Application (rather than
+/// columns on it) because it's rewritten every time a score changes,
+/// while Application is comparatively stable — separating them keeps
+/// write contention and change history scoped to what's actually
+/// volatile.
+model ApplicationScore {
+  id            String      @id @default(cuid())
+  applicationId String      @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  cohortId      String
+  cohort        Cohort      @relation(fields: [cohortId], references: [id])
+
+  reviewAverage       Decimal? @db.Decimal(6, 2)
+  reviewScoreCount    Int      @default(0)
+  interviewAverage    Decimal? @db.Decimal(6, 2)
+  interviewScoreCount Int      @default(0)
+  compositeScore      Decimal? @db.Decimal(6, 2)
+
+  rank         Int?
+  rankingTier  RankingTier @default(NOT_RANKED)
+  isRankLocked Boolean     @default(false)
+
+  lastComputedAt DateTime?
+  updatedAt      DateTime  @updatedAt
+
+  @@index([cohortId, rank])
+  @@index([cohortId, compositeScore])
+  @@map("application_scores")
+}
+
+/// An immutable, named, sized, lockable point-in-time ranking (e.g.
+/// "Interview Shortlist" sized 70, "Final Selection" sized 60) —
+/// generalized rather than two hardcoded tables, since target sizes are
+/// programme policy, not schema. `isLocked` is what "locking rankings
+/// after approval" means: once locked, the snapshot's entries are the
+/// permanent historical record regardless of later ApplicationScore
+/// recalculation.
+model RankingSnapshot {
+  id       String @id @default(cuid())
+  cohortId String
+  cohort   Cohort @relation(fields: [cohortId], references: [id])
+
+  name          String
+  targetSize    Int
+  isLocked      Boolean  @default(false)
+  generatedById String
+  generatedBy   User     @relation(fields: [generatedById], references: [id])
+  generatedAt   DateTime @default(now())
+
+  /// §5.8 Ranking Review and Approval — set when `isLocked` flips true.
+  /// Only the most recent approve/reopen cycle's metadata; the full
+  /// history of every approve/reopen on this snapshot lives in the audit
+  /// log (RANKING_APPROVED/RANKING_REOPENED), same "current state here,
+  /// history in the audit trail" split as ReviewFramework.publishedAt.
+  approvedById String?
+  approvedBy   User?     @relation("RankingSnapshotApprovedBy", fields: [approvedById], references: [id])
+  approvedAt   DateTime?
+
+  reopenedById String?
+  reopenedBy   User?     @relation("RankingSnapshotReopenedBy", fields: [reopenedById], references: [id])
+  reopenedAt   DateTime?
+  reopenReason String?
+
+  entries        RankingSnapshotEntry[]
+  tieResolutions RankingTieResolution[]
+  approvalStages RankingApprovalStage[]
+
+  @@index([cohortId, generatedAt])
+  @@map("ranking_snapshots")
+}
+
+model RankingSnapshotEntry {
+  id                String          @id @default(cuid())
+  rankingSnapshotId String
+  rankingSnapshot   RankingSnapshot @relation(fields: [rankingSnapshotId], references: [id], onDelete: Cascade)
+  applicationId     String
+  application       Application     @relation(fields: [applicationId], references: [id])
+
+  rank  Int
+  score Decimal @db.Decimal(6, 2)
+
+  @@unique([rankingSnapshotId, applicationId])
+  @@index([rankingSnapshotId, rank])
+  @@map("ranking_snapshot_entries")
+}
+
+enum TieResolutionStatus {
+  PENDING
+  RESOLVED
+}
+
+/// Addendum Module 5, Tie Level 3 — two or more applications still tied
+/// after Level 1 (interview score) and Level 2 (application review
+/// score) both matched exactly. Created automatically when
+/// `generateFinalRankingSnapshot` detects one; the tied applications
+/// still get a deterministic (but explicitly flagged, non-authoritative)
+/// storage rank so the snapshot itself always has a total order — this
+/// record is what makes the Level 3 "Committee reviews... records
+/// mandatory justification" requirement an auditable fact, not just a
+/// UI badge. `RankingSnapshotEntry.score`/`.rank` already capture each
+/// tied application's original score/position immutably; this record
+/// only adds what the snapshot entry can't: the resolution itself.
+model RankingTieResolution {
+  id                String          @id @default(cuid())
+  rankingSnapshotId String
+  rankingSnapshot   RankingSnapshot @relation(fields: [rankingSnapshotId], references: [id], onDelete: Cascade)
+  cohortId          String
+  cohort            Cohort          @relation(fields: [cohortId], references: [id])
+
+  /// The composite score every tied application in this group shares.
+  score  Decimal             @db.Decimal(6, 2)
+  status TieResolutionStatus @default(PENDING)
+
+  justification String?
+  resolvedById  String?
+  resolvedBy    User?     @relation("RankingTieResolutionResolver", fields: [resolvedById], references: [id])
+  resolvedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  applications RankingTieResolutionApplication[]
+
+  @@index([cohortId, status])
+  @@index([rankingSnapshotId])
+  @@map("ranking_tie_resolutions")
+}
+
+/// One row per application caught in a Level 3 tie — `resolvedRank`
+/// records the committee's chosen order within the tied group once
+/// resolved (null while `status = PENDING`).
+model RankingTieResolutionApplication {
+  id                     String               @id @default(cuid())
+  rankingTieResolutionId String
+  rankingTieResolution   RankingTieResolution @relation(fields: [rankingTieResolutionId], references: [id], onDelete: Cascade)
+  applicationId          String
+  application            Application          @relation(fields: [applicationId], references: [id])
+
+  resolvedRank Int?
+
+  @@unique([rankingTieResolutionId, applicationId])
+  @@map("ranking_tie_resolution_applications")
+}
+
+enum RankingApprovalStageType {
+  TOP_70
+  TOP_60
+  FINAL_SELECTION
+  VERIFICATION_CONFIRMATION
+}
+
+enum RankingApprovalDecision {
+  APPROVED
+  REJECTED
+}
+
+/// Executive Approval Data Model (Planning Phase 3) — the staged Top 70
+/// → Top 60 → Final Selection → Verification & Confirmation sign-off
+/// applied to a whole RankingSnapshot at once, exercised by the
+/// long-dormant EXECUTIVE_APPROVE permission (defined and granted since
+/// V1, never checked by any code path until now).
+///
+/// Deliberately NOT the same thing as `ExecutiveApproval` below: that
+/// model is a single, per-application APPROVED/RETURNED/
+/// CLARIFICATION_REQUESTED decision (also scaffolded, also still
+/// unconsumed by any service — a separate later concern, likely
+/// individual admissions sign-off). This model is a repeatable,
+/// cohort-wide, ordered gate history on the ranking as a whole. Both are
+/// real and both stay; they answer different questions.
+model RankingApprovalStage {
+  id                String          @id @default(cuid())
+  rankingSnapshotId String
+  rankingSnapshot   RankingSnapshot @relation(fields: [rankingSnapshotId], references: [id], onDelete: Cascade)
+
+  stage    RankingApprovalStageType
+  decision RankingApprovalDecision
+
+  approverId String
+  approver   User   @relation("RankingApprovalStageApprover", fields: [approverId], references: [id])
+
+  /// Required when decision = REJECTED — enforced in the service layer,
+  /// matching this codebase's convention of keeping conditionally-
+  /// required validation in Zod/service code rather than the schema.
+  comment String?
+
+  /// This row's resulting workflow status, alongside the snapshot's most
+  /// recent prior status — together they let the full staged history be
+  /// read back without re-deriving it from every row every time. Both
+  /// computed by the service (`${stage}_${decision}`), never user input.
+  previousStatus String?
+  newStatus      String
+
+  createdAt DateTime @default(now())
+
+  @@index([rankingSnapshotId, createdAt])
+  @@map("ranking_approval_stages")
+}
+
+// =============================================================================
+// Interviews — four-panelist scoring
+// =============================================================================
+
+enum InterviewStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+/// PAM-P 2026 Interview Score Sheet.
+enum InterviewMode {
+  VIRTUAL
+  PHYSICAL
+  HYBRID
+}
+
+/// Interview Configuration §4/§6 — manually recorded by the Programme
+/// Secretariat (no automatic Teams attendance retrieval is assumed).
+enum InterviewAttendanceStatus {
+  /// The default — nothing recorded yet.
+  SCHEDULED
+  PRESENT
+  LATE
+  ABSENT
+  TECHNICAL_ISSUE
+  RESCHEDULED
+  CANCELLED
+}
+
+/// Configurable interview scoring rubric — same shape/pattern as
+/// ReviewCriterion, intentionally, so one mental model covers both.
+model InterviewCriterion {
+  id       String @id @default(cuid())
+  cohortId String
+  cohort   Cohort @relation(fields: [cohortId], references: [id])
+
+  label       String
+  description String?
+  maxScore    Decimal @db.Decimal(6, 2)
+  weight      Decimal @default(1) @db.Decimal(6, 2)
+  order       Int     @default(0)
+  isActive    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scoreEntries InterviewScoreEntry[]
+
+  @@index([cohortId, isActive])
+  @@map("interview_criteria")
+}
+
+/// Addendum Module 3 — the hybrid questioning model's three buckets.
+/// MANDATORY: every applicant, cannot be skipped. PATHWAY: auto-displayed
+/// when it matches the applicant's leadership pathway. ADDITIONAL_BANK:
+/// panellists may pick these during the interview, but may never type an
+/// ad hoc question — this enum is what makes "approved bank only" a
+/// closed set rather than a UI convention.
+enum InterviewQuestionCategory {
+  MANDATORY
+  PATHWAY
+  /// Interview Configuration §8C — "assess judgement under pressure."
+  /// Not pathway-specific; the FMS randomly selects 1 from the whole
+  /// active situational bank for every interview, the same random-
+  /// selection treatment PATHWAY questions now get (see
+  /// modules/interviews/domain/interviewQuestions.ts's
+  /// `selectAutoAskedQuestions`).
+  SITUATIONAL
+  ADDITIONAL_BANK
+}
+
+/// The three leadership pathways named verbatim in the Addendum (§3).
+/// Deliberately a real enum here even though `Application.pathway` (the
+/// applicant-facing field) stays free text — that field is populated by
+/// Excel/CSV import and outside this module's control, but a
+/// PATHWAY-category question's pathway is admin-authored data this
+/// module fully owns, so it gets compile-time exhaustiveness. Matching
+/// an application's free-text pathway string against this enum happens
+/// once, at read time (see modules/interviews/domain/interviewQuestions.ts).
+enum InterviewPathway {
+  ENTREPRENEURSHIP_ENTERPRISE
+  PUBLIC_PRIVATE_SECTOR_LEADERSHIP
+  ACADEMIA_ADVANCED_STUDIES
+}
+
+/// Admin-configurable interview questions. Free-standing (not linked to
+/// InterviewScoreEntry) — panelists score against InterviewCriterion
+/// competencies, not per-question; questions are a shared prompt sheet,
+/// not a per-response record.
+///
+/// No delete endpoint exists for this model (Addendum Module 3 — a
+/// question already asked in a completed interview must not lose its
+/// historical record) — `isActive` is the only lifecycle-ending state,
+/// same convention as `EligibilityCriterion`. Once a question has ≥1
+/// `InterviewQuestionAsked` row, `text`/`category`/`pathway` become
+/// immutable at the service layer (see ADR-0019) — `isActive`/`order`
+/// stay freely editable since neither affects what was historically asked.
+model InterviewQuestion {
+  id       String @id @default(cuid())
+  cohortId String
+  cohort   Cohort @relation(fields: [cohortId], references: [id])
+
+  text     String
+  category InterviewQuestionCategory
+  /// Set only when category = PATHWAY; null otherwise. Validated at the
+  /// domain layer, not a DB constraint — matches this codebase's
+  /// established validate-in-application-layer convention.
+  pathway  InterviewPathway?
+  order    Int                       @default(0)
+  isActive Boolean                   @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  askedIn InterviewQuestionAsked[]
+
+  @@index([cohortId, category, isActive])
+  @@map("interview_questions")
+}
+
+/// Addendum §3 provenance tracking — "System records: every question
+/// asked; panelist selecting additional question." One row per question
+/// actually asked in a given interview; `@@unique` makes re-selecting an
+/// already-asked question a clean rejection rather than a duplicate row.
+/// Mandatory/matched-pathway questions are recorded here automatically
+/// when the interview session starts (see startInterviewSession); bank
+/// questions are recorded one at a time as a panellist picks each one.
+model InterviewQuestionAsked {
+  id          String            @id @default(cuid())
+  interviewId String
+  interview   Interview         @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  questionId  String
+  question    InterviewQuestion @relation(fields: [questionId], references: [id])
+
+  askedByPanelistId String
+  askedByPanelist   User     @relation("InterviewQuestionAskedBy", fields: [askedByPanelistId], references: [id])
+  askedAt           DateTime @default(now())
+
+  @@unique([interviewId, questionId])
+  @@map("interview_questions_asked")
+}
+
+/// Interview Scheduling (Enterprise Functional Specification Addendum):
+/// `scheduledAt` is nullable because an Interview row is now created as
+/// a "shell" once its panel is assigned (Release 1 Module 1's
+/// `autoAssignPanel`/`scheduleInterview`), *before* a time is known — the
+/// slot-generation → applicant-booking → Secretariat-confirmation flow
+/// (see docs/INTERVIEW_SCHEDULING.md) is what eventually sets it, via
+/// `selectedSlot.startsAt`. A direct-schedule path (`scheduledAt` known
+/// up front) remains valid too — not every interview needs to go through
+/// applicant self-booking.
+model Interview {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  cohortId      String
+  cohort        Cohort      @relation(fields: [cohortId], references: [id])
+
+  scheduledAt     DateTime?
+  durationMinutes Int             @default(30)
+  meetingLink     String?
+  /// PAM-P 2026 Interview Score Sheet — Virtual/Physical/Hybrid, an
+  /// interview-level fact (like meetingLink), not per-panellist.
+  /// Nullable: not set until the Secretariat records it, and existing
+  /// interviews predate this field.
+  mode            InterviewMode?
+  status          InterviewStatus @default(SCHEDULED)
+
+  /// Applicant self-booking workflow state — see InterviewBookingStatus.
+  bookingStatus  InterviewBookingStatus @default(AWAITING_SLOTS)
+  candidateSlots InterviewSlot[]        @relation("InterviewCandidateSlots")
+  selectedSlotId String?                @unique
+  selectedSlot   InterviewSlot?         @relation("InterviewSelectedSlot", fields: [selectedSlotId], references: [id])
+
+  /// SHA-256 of the raw booking token sent to the applicant — the raw
+  /// value is never stored, only ever compared by hash (same principle
+  /// as a password hash: a leaked database row alone can't be replayed
+  /// as a valid token). Regenerating a token overwrites both fields;
+  /// there is at most one live token per interview.
+  bookingTokenHash      String?   @unique
+  bookingTokenExpiresAt DateTime?
+
+  teamsLink          String?
+  teamsLinkAddedAt   DateTime?
+  teamsLinkAddedById String?
+  teamsLinkAddedBy   User?     @relation("InterviewTeamsLinkAddedBy", fields: [teamsLinkAddedById], references: [id], onDelete: SetNull)
+
+  invitationsSentAt DateTime?
+
+  confirmedAt   DateTime?
+  confirmedById String?
+  confirmedBy   User?     @relation("InterviewConfirmedBy", fields: [confirmedById], references: [id], onDelete: SetNull)
+
+  declinedAt    DateTime?
+  declinedById  String?
+  declinedBy    User?     @relation("InterviewDeclinedBy", fields: [declinedById], references: [id], onDelete: SetNull)
+  declineReason String?
+
+  /// Microsoft Teams Interview Integration — an outright cancellation
+  /// (status -> CANCELLED), distinct from declinedAt/declineReason above
+  /// (which only ever resets a *pending* applicant booking back to
+  /// SLOTS_PUBLISHED, never ends the interview itself). Cancelling also
+  /// cancels any synced or manual Teams meeting — see
+  /// modules/interviews/services/teamsMeetingService.ts.
+  cancelledAt        DateTime?
+  cancelledById      String?
+  cancelledBy        User?     @relation("InterviewCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  cancellationReason String?
+
+  /// Addendum §2.6 — "Close Interview with Three Valid Scores." Set only
+  /// by closeInterviewWithOverride (Programme Secretariat only), never
+  /// cleared afterwards; all four fields are set together, same shape as
+  /// declinedAt/declinedById/declineReason above. scoringOverrideAt also
+  /// gates further score mutation on this interview — see
+  /// InterviewScoringClosedError.
+  scoringOverrideAt                DateTime?
+  scoringOverrideById              String?
+  scoringOverrideBy                User?     @relation("InterviewScoringOverrideBy", fields: [scoringOverrideById], references: [id], onDelete: SetNull)
+  scoringOverrideReason            String?
+  /// The one active panellist who had not submitted when the Secretariat
+  /// invoked the override — recorded automatically, never client-supplied
+  /// (derived server-side from the panel's actual submission state).
+  scoringOverrideMissingPanelistId String?
+  scoringOverrideMissingPanelist   User?     @relation("InterviewScoringOverrideMissingPanelist", fields: [scoringOverrideMissingPanelistId], references: [id], onDelete: SetNull)
+
+  /// Addendum Module 3 — "System records: interview start time; interview
+  /// end time." Distinct from `scheduledAt` (the planned time) — these are
+  /// the actual observed session boundaries, set by whichever active
+  /// panellist starts/ends the session (no chair-only restriction —
+  /// InterviewPanelist.isChair is decorative everywhere else in this
+  /// codebase too, see docs/INTERVIEW_ASSIGNMENT_ENGINE.md). Starting the
+  /// session also auto-records every active mandatory/matched-pathway
+  /// InterviewQuestion as asked; ending it locks the asked-question list.
+  actualStartedAt   DateTime?
+  actualStartedById String?
+  actualStartedBy   User?     @relation("InterviewActualStartedBy", fields: [actualStartedById], references: [id], onDelete: SetNull)
+  actualEndedAt     DateTime?
+  actualEndedById   String?
+  actualEndedBy     User?     @relation("InterviewActualEndedBy", fields: [actualEndedById], references: [id], onDelete: SetNull)
+
+  /// Interview Configuration §6/§4.6 — the Secretariat records this
+  /// manually (`INTERVIEW_ATTENDANCE_RECORD`). No automatic Teams
+  /// attendance retrieval exists in this integration — confirming
+  /// Microsoft Graph's attendance-report API is available and
+  /// permissioned for this tenant is a separate, later decision, not
+  /// assumed here (see docs/TEAMS_INTEGRATION.md). Defaults to
+  /// `SCHEDULED`, the only status implying "not yet recorded."
+  attendanceStatus       InterviewAttendanceStatus @default(SCHEDULED)
+  attendanceRecordedAt   DateTime?
+  attendanceRecordedById String?
+  attendanceRecordedBy   User?                     @relation("InterviewAttendanceRecordedBy", fields: [attendanceRecordedById], references: [id], onDelete: SetNull)
+  attendanceNote         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  panelists      InterviewPanelist[]
+  scores         InterviewScore[]
+  questionsAsked InterviewQuestionAsked[]
+  teamsMeeting   InterviewTeamsMeeting?
+
+  @@index([cohortId, scheduledAt])
+  @@index([applicationId])
+  @@map("interviews")
+}
+
+enum TeamsMeetingSyncStatus {
+  /// Sync attempted at least once but not yet confirmed successful, or
+  /// never yet attempted (the row's very first state).
+  PENDING
+  /// Graph confirmed the meeting exists with this joinUrl/graphEventId —
+  /// the only status a screener/panellist should treat as a real, live
+  /// Teams meeting.
+  SYNCED
+  /// The most recent create/update attempt failed — failureReason and
+  /// retryCount explain why and how many times. Never silently reported
+  /// as SYNCED; the caller who attempted the sync always sees the
+  /// failure too (thrown error), not just this row's state.
+  FAILED
+  /// Cancelled via cancelOnlineMeetingEvent (or never reached Graph in
+  /// the first place — see cancelledAt for which).
+  CANCELLED
+}
+
+/// Microsoft Teams Interview Integration — a real Graph-synced online
+/// meeting, distinct from `Interview.teamsLink` (the pre-existing
+/// manually-entered fallback link — no Graph event behind it, never
+/// synced, never updated by this model). At most one row per Interview;
+/// reschedule/cancel act on this same row's `graphEventId` (PATCH/
+/// cancel), never creating a second meeting for the same interview. See
+/// docs/TEAMS_INTEGRATION.md.
+model InterviewTeamsMeeting {
+  id          String    @id @default(cuid())
+  interviewId String    @unique
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  /// The Microsoft Graph calendar event ID backing this meeting — not a
+  /// token or secret, safe to store; used to PATCH/cancel the same event
+  /// on reschedule/cancel instead of creating a duplicate. Null until
+  /// the first successful sync.
+  graphEventId String?
+  /// The actual Teams join URL Graph returned. Null until synced —
+  /// deliberately never falls back to `Interview.teamsLink`'s value, so
+  /// the UI can never present an unsynced/failed state as if it were a
+  /// live Teams meeting.
+  joinUrl      String?
+
+  /// The Microsoft 365 account (UPN) Graph creates the calendar event
+  /// under — one fixed organiser mailbox from `MS_GRAPH_ORGANISER_UPN`,
+  /// captured at sync time for traceability. Not a `User` relation: this
+  /// is a service/shared mailbox, not necessarily any individual FMS
+  /// user's own account.
+  organiserUpn String?
+
+  syncStatus      TeamsMeetingSyncStatus @default(PENDING)
+  lastSyncedAt    DateTime?
+  lastAttemptedAt DateTime?
+  /// Set on the most recent failed attempt; cleared on the next success.
+  /// Never includes raw Graph error bodies verbatim (could echo request
+  /// details) — see teamsMeetingService.ts's sanitiseGraphError.
+  failureReason   String?
+  retryCount      Int                    @default(0)
+
+  cancelledAt   DateTime?
+  cancelledById String?
+  cancelledBy   User?     @relation("InterviewTeamsMeetingCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  createdById String
+  createdBy   User   @relation("InterviewTeamsMeetingCreatedBy", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([syncStatus])
+  @@map("interview_teams_meetings")
+}
+
+enum InterviewBookingStatus {
+  /// Panel assigned, but candidate slots not yet generated/published.
+  AWAITING_SLOTS
+  /// Candidate slots generated and visible to the applicant via their booking link.
+  SLOTS_PUBLISHED
+  /// Applicant has selected a slot; awaiting Secretariat confirm/decline.
+  PENDING_CONFIRMATION
+  /// Secretariat confirmed — this is now an official interview.
+  CONFIRMED
+  /// Secretariat declined the applicant's chosen slot; back to SLOTS_PUBLISHED for a new pick.
+  DECLINED
+}
+
+/// One candidate time window offered to an applicant for their
+/// interview — generated only where all of that interview's currently-
+/// assigned panelists are simultaneously available (§1.3). Several rows
+/// typically exist per Interview (the applicant chooses one); this is
+/// why it's its own table rather than fields on Interview directly.
+model InterviewSlot {
+  id          String    @id @default(cuid())
+  interviewId String
+  interview   Interview @relation("InterviewCandidateSlots", fields: [interviewId], references: [id], onDelete: Cascade)
+
+  startsAt DateTime
+  endsAt   DateTime
+  status   InterviewSlotStatus @default(OPEN)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  selectedByInterview Interview? @relation("InterviewSelectedSlot")
+
+  @@unique([interviewId, startsAt])
+  @@index([interviewId, status])
+  @@map("interview_slots")
+}
+
+enum InterviewSlotStatus {
+  OPEN
+  SELECTED
+  CANCELLED
+}
+
+/// An interviewer's declared availability for a cohort's interview
+/// period (§1.2) — available windows, temporary unavailability, and
+/// leave periods are all the same shape (a time range plus a type), so
+/// one model covers all three rather than three parallel tables.
+model InterviewerAvailability {
+  id            String @id @default(cuid())
+  interviewerId String
+  interviewer   User   @relation(fields: [interviewerId], references: [id])
+  cohortId      String
+  cohort        Cohort @relation(fields: [cohortId], references: [id])
+
+  type     AvailabilityType
+  startsAt DateTime
+  endsAt   DateTime
+  /// Required for UNAVAILABLE/LEAVE, null for AVAILABLE.
+  reason   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([interviewerId, cohortId])
+  @@index([cohortId, startsAt])
+  @@map("interviewer_availability")
+}
+
+enum AvailabilityType {
+  AVAILABLE
+  UNAVAILABLE
+  LEAVE
+}
+
+/// Exactly four seats per interview by business rule — enforced in
+/// modules/interviews (application layer), not the database; Postgres/
+/// Prisma can't express "exactly 4 rows per parent" declaratively without
+/// a trigger, and a trigger is more operational surface than this needs
+/// right now. See docs/database.md.
+///
+/// Release 1 Module 1 (Interview Assignment Engine): extended with the
+/// exact reassignment-with-history shape Phase 3B's `ReviewAssignment`
+/// already established — an old row is never deleted or mutated in
+/// place on reassignment, only transitioned to `REASSIGNED` and linked
+/// to its replacement via `reassignedFromId`. `@@unique([interviewId,
+/// userId])` was replaced by a partial unique index (this migration's
+/// raw SQL, same pattern as `review_assignments_applicationId_slot_active_key`)
+/// scoped to non-`REASSIGNED`/`CANCELLED` rows, so a panelist reassigned
+/// off an interview can later be reassigned back onto it without
+/// colliding with their own superseded row.
+model InterviewPanelist {
+  id          String    @id @default(cuid())
+  interviewId String
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+
+  isChair Boolean @default(false)
+
+  assignedMethod AssignmentMethod @default(AUTO)
+  assignedAt     DateTime         @default(now())
+  /// Null for AUTO (system-triggered). Set for MANUAL.
+  assignedById   String?
+  assignedBy     User?            @relation("InterviewPanelistAssignedBy", fields: [assignedById], references: [id], onDelete: SetNull)
+
+  status PanelistAssignmentStatus @default(ASSIGNED)
+
+  cancelledAt   DateTime?
+  cancelledById String?
+  cancelledBy   User?     @relation("InterviewPanelistCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  cancelReason  String?
+
+  /// Same reassignment-history shape as `ReviewAssignment.reassignedFromId`
+  /// — see that field's doc comment for the exact mechanics.
+  reassignedFromId String?            @unique
+  reassignedFrom   InterviewPanelist? @relation("InterviewPanelistReassignment", fields: [reassignedFromId], references: [id])
+  reassignedTo     InterviewPanelist? @relation("InterviewPanelistReassignment")
+  reassignedAt     DateTime?
+  reassignedById   String?
+  reassignedBy     User?              @relation("InterviewPanelistReassignedBy", fields: [reassignedById], references: [id], onDelete: SetNull)
+  reassignReason   String?
+
+  @@index([interviewId, userId])
+  @@index([userId])
+  @@map("interview_panelists")
+}
+
+enum PanelistAssignmentStatus {
+  ASSIGNED
+  REASSIGNED
+  CANCELLED
+}
+
+/// An interviewer's capacity/availability, scoped to one programme —
+/// identical shape to `ReviewerCapacity`, kept as a separate model
+/// rather than reused: an interviewer's concurrent-interview limit is a
+/// different resource from a reviewer's concurrent-application limit,
+/// and conflating them under one reviewer-named table would misuse a
+/// name that already means something specific elsewhere in this
+/// codebase.
+model InterviewerCapacity {
+  id            String    @id @default(cuid())
+  interviewerId String
+  interviewer   User      @relation(fields: [interviewerId], references: [id])
+  programmeId   String
+  programme     Programme @relation(fields: [programmeId], references: [id])
+
+  maxConcurrentInterviews Int       @default(10)
+  isAvailable             Boolean   @default(true)
+  unavailableReason       String?
+  unavailableUntil        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([interviewerId, programmeId])
+  @@map("interviewer_capacities")
+}
+
+/// An interviewer never receives a panel seat for an application they
+/// have a recorded conflict against — same enforcement point and
+/// `ConflictSource` reuse as `ReviewConflictOfInterest`, kept as a
+/// separate model for the same reason `InterviewerCapacity` is: a
+/// distinct resource (panel seats, not review assignments).
+model InterviewConflictOfInterest {
+  id            String      @id @default(cuid())
+  interviewerId String
+  interviewer   User        @relation("InterviewConflictInterviewer", fields: [interviewerId], references: [id])
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  reason       String
+  source       ConflictSource
+  declaredById String
+  declaredBy   User           @relation("InterviewConflictDeclaredBy", fields: [declaredById], references: [id])
+
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@unique([interviewerId, applicationId])
+  @@index([applicationId])
+  @@map("interview_conflicts_of_interest")
+}
+
+/// PAM-P 2026 Interview Score Sheet — the panellist's closed-choice
+/// recommendation (a checkbox row, not free text).
+enum InterviewRecommendation {
+  STRONGLY_RECOMMEND
+  RECOMMEND
+  RESERVE
+  NOT_RECOMMENDED
+  INTEGRITY_HOLD
+}
+
+/// One panelist's independent score for one interview. Each panelist
+/// scores, comments, and submits on their own — no shared draft, no
+/// visibility into other panelists' scores until all have submitted
+/// (same blind-until-submitted enforcement pattern as Review, at the
+/// repository layer).
+model InterviewScore {
+  id          String    @id @default(cuid())
+  interviewId String
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  panelistId  String
+  panelist    User      @relation(fields: [panelistId], references: [id])
+
+  status     ScoreSubmissionStatus @default(DRAFT)
+  totalScore Decimal?              @db.Decimal(6, 2)
+
+  /// Addendum §2.3 — four distinct fields, replacing the single freeform
+  /// `comments` field ADR-0016 deliberately kept minimal pending this
+  /// module. Read-only after submission, same as the rest of the score.
+  overallAssessment String?
+  strengths         String?
+  concerns          String?
+  /// PAM-P 2026 Interview Score Sheet — a closed choice, not free text
+  /// (the panellist checks exactly one box). Was originally String? per
+  /// ADR-0018/the Addendum, which didn't specify the option set; the
+  /// Score Sheet is the source that does.
+  recommendation    InterviewRecommendation?
+
+  /// PAM-P 2026 Interview Score Sheet — a panellist's own factual flag,
+  /// distinct from the INTEGRITY_HOLD recommendation option (that's a
+  /// selection outcome; this is "something's worth flagging" regardless
+  /// of the overall recommendation). Never touches calculateInterviewTotal.
+  integrityFlag Boolean @default(false)
+
+  submittedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  entries InterviewScoreEntry[]
+
+  @@unique([interviewId, panelistId])
+  @@map("interview_scores")
+}
+
+model InterviewScoreEntry {
+  id               String             @id @default(cuid())
+  interviewScoreId String
+  interviewScore   InterviewScore     @relation(fields: [interviewScoreId], references: [id], onDelete: Cascade)
+  criterionId      String
+  criterion        InterviewCriterion @relation(fields: [criterionId], references: [id])
+
+  score Decimal @db.Decimal(6, 2)
+
+  @@unique([interviewScoreId, criterionId])
+  @@map("interview_score_entries")
+}
+
+// =============================================================================
+// Selection Committee, Executive Approval, Admissions
+// =============================================================================
+
+enum SelectionOutcome {
+  SELECTED
+  RESERVE
+  REJECTED
+}
+
+/// One committee member's individual vote. Distinct from CommitteeDecision
+/// (the recorded aggregate outcome) — the vote is what each member cast;
+/// the decision is what the committee chair/system recorded as final.
+model CommitteeVote {
+  id                String      @id @default(cuid())
+  applicationId     String
+  application       Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  committeeMemberId String
+  committeeMember   User        @relation(fields: [committeeMemberId], references: [id])
+
+  recommendation SelectionOutcome
+  proposedRank   Int?
+  comments       String?
+  votedAt        DateTime         @default(now())
+
+  @@unique([applicationId, committeeMemberId])
+  @@map("committee_votes")
+}
+
+model CommitteeDecision {
+  id            String      @id @default(cuid())
+  applicationId String      @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  decision    SelectionOutcome
+  finalRank   Int?
+  rationale   String?
+  decidedById String
+  decidedBy   User             @relation("CommitteeDecisionDecider", fields: [decidedById], references: [id])
+  decidedAt   DateTime         @default(now())
+
+  @@map("committee_decisions")
+}
+
+enum ExecutiveDecision {
+  APPROVED
+  RETURNED
+  CLARIFICATION_REQUESTED
+}
+
+/// Role-gated to EXECUTIVE for the decision itself; PROGRAMME_SECRETARY
+/// has read access to this table (global visibility) but no action
+/// permission can grant it a write here — see lib/rbac/actions.ts.
+model ExecutiveApproval {
+  id            String      @id @default(cuid())
+  applicationId String      @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  decision   ExecutiveDecision
+  notes      String?
+  approverId String
+  approver   User              @relation("ExecutiveApprover", fields: [approverId], references: [id])
+  decidedAt  DateTime          @default(now())
+
+  @@map("executive_approvals")
+}
+
+enum AdmissionOfferStatus {
+  PENDING
+  SENT
+  ACCEPTED
+  DECLINED
+  EXPIRED
+}
+
+model AdmissionOffer {
+  id            String      @id @default(cuid())
+  applicationId String      @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  status              AdmissionOfferStatus @default(PENDING)
+  /// Fixed per-cohort onboarding checklist template + completion state —
+  /// JSON here is a deliberate exception to "never JSON for scoring":
+  /// checklist items aren't aggregated/ranked/reported on the way scores
+  /// are, so they don't need ApplicationScore's relational treatment.
+  onboardingChecklist Json?
+
+  issuedById  String
+  issuedBy    User      @relation("AdmissionOfferIssuer", fields: [issuedById], references: [id])
+  offerSentAt DateTime?
+  respondedAt DateTime?
+  expiresAt   DateTime?
+  notes       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("admission_offers")
+}
+
+// =============================================================================
+// Notes
+// =============================================================================
+
+enum NoteVisibility {
+  REVIEWER
+  INTERVIEWER
+  COMMITTEE
+  EXECUTIVE
+  ALL_STAFF
+}
+
+/// Role-scoped commentary on an application. Soft-deletable — a note is
+/// something a user might legitimately want to retract, unlike a Review
+/// or vote, which is a formal record.
+model Note {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  authorId      String
+  author        User        @relation(fields: [authorId], references: [id])
+
+  body       String
+  visibility NoteVisibility @default(ALL_STAFF)
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([applicationId, createdAt])
+  @@index([authorId])
+  @@map("notes")
+}
+
+// =============================================================================
+// Notifications
+// =============================================================================
+
+/// Minimal operational notification (assignment, scheduling, stage
+/// progression, approval, offer) for a signed-in FMS staff user — always
+/// in-app, never emailed. Kept separate from `OutboundNotification`
+/// below (real email delivery, staff or applicant): a staff member's
+/// bell-icon alert and an emailed message are different enough shapes
+/// (this row has no template/retry/delivery-status concept, and an
+/// applicant has no `User` row to attach one to) that merging them would
+/// force one of the two into an unnatural fit. See
+/// docs/NOTIFICATIONS.md.
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type       String
+  title      String
+  body       String?
+  entityType String?
+  entityId   String?
+  isRead     Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+enum NotificationRecipientType {
+  APPLICANT
+  USER
+}
+
+/// `PENDING` → (`SCHEDULED` if a future `scheduledFor` was given, else
+/// straight to `PROCESSING`) → `SENT` | `FAILED` (→ `RETRYING` →
+/// `PROCESSING` again) | `CANCELLED` (only ever from `PENDING`/
+/// `SCHEDULED` — a `PROCESSING` or already-`SENT` row can't be
+/// cancelled). See `modules/notifications/domain/outboundNotification.ts`
+/// for the actual transition guard.
+enum OutboundNotificationStatus {
+  PENDING
+  SCHEDULED
+  PROCESSING
+  SENT
+  FAILED
+  RETRYING
+  CANCELLED
+}
+
+/// One version of one event's message. `event` is a string, not an enum
+/// — see `modules/notifications/eventCatalogue.ts`'s own doc comment for
+/// why (the event list is code-defined but deliberately not a database
+/// enum, so a new event never needs a migration). `(event, version)` is
+/// unique; `isActive` marks which version is currently used —
+/// deliberately versioned rather than edited in place, so a historical
+/// `OutboundNotification` row's `template` relation always shows exactly
+/// the wording that was actually sent, not whatever the template reads
+/// today.
+model NotificationTemplate {
+  id      String @id @default(cuid())
+  event   String
+  version Int    @default(1)
+
+  subject String
+  body    String
+
+  isActive Boolean @default(true)
+
+  updatedById String?
+  updatedBy   User?   @relation("NotificationTemplateUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  outboundNotifications OutboundNotification[]
+
+  @@unique([event, version])
+  @@index([event, isActive])
+  @@map("notification_templates")
+}
+
+/// The outbox — one row per attempted (or scheduled) send. Recipient is
+/// either an `Applicant` (no login, email-only, one-way) or a `User`
+/// (FMS staff), never both — `recipientType` names which relation is
+/// populated. `recipientEmail` is captured at enqueue time, not read
+/// live from the recipient at send time, so a historical row always
+/// shows the address actually attempted even if the person's email is
+/// later corrected. `internalComment` (staff-only, e.g. an integrity
+/// note) and `applicantFacingComment` (safe to include in the rendered
+/// message) are deliberately separate fields — never the same string
+/// read two ways — see docs/NOTIFICATIONS.md's "never send internal-only
+/// content to applicants" rule.
+model OutboundNotification {
+  id    String @id @default(cuid())
+  event String
+
+  recipientType  NotificationRecipientType
+  applicantId    String?
+  applicant      Applicant?                @relation(fields: [applicantId], references: [id], onDelete: Cascade)
+  userId         String?
+  user           User?                     @relation("OutboundNotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  recipientEmail String
+
+  templateId String
+  template   NotificationTemplate @relation(fields: [templateId], references: [id])
+  variables  Json
+
+  internalComment        String?
+  applicantFacingComment String?
+
+  status       OutboundNotificationStatus @default(PENDING)
+  scheduledFor DateTime?
+  sentAt       DateTime?
+
+  /// The email provider's own message identifier (Microsoft Graph's
+  /// `sendMail` returns none directly — see `lib/msgraph/mailClient.ts` —
+  /// so this is populated only where a provider actually supplies one;
+  /// never a credential, safe to store.
+  providerMessageId String?
+  /// Sanitised, never a raw provider error body — mirrors
+  /// `InterviewTeamsMeeting.failureReason`'s exact discipline.
+  failureReason     String?
+  retryCount        Int     @default(0)
+
+  /// Polymorphic, mirrors `AuditLog.entityType`/`entityId` — e.g.
+  /// ("Application", applicationId) for an eligibility-decision email,
+  /// ("Interview", interviewId) for a reminder. Used for duplicate
+  /// prevention (§5.3) — a second attempt to enqueue the same
+  /// (event, relatedEntityType, relatedEntityId) while a prior one is
+  /// still live is a no-op, not a second email.
+  relatedEntityType String?
+  relatedEntityId   String?
+  correlationId     String  @default(cuid())
+
+  cancelledAt   DateTime?
+  cancelledById String?
+  cancelledBy   User?     @relation("OutboundNotificationCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  /// Null for a system-triggered send (e.g. an automatic eligibility
+  /// decision) — not every notification has a human "sender."
+  createdById String?
+  createdBy   User?   @relation("OutboundNotificationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, scheduledFor])
+  @@index([event])
+  @@index([applicantId])
+  @@index([userId])
+  @@index([relatedEntityType, relatedEntityId])
+  @@map("outbound_notifications")
+}
