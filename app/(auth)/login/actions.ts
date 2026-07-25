@@ -6,6 +6,7 @@ import { AuthError } from "next-auth";
 import { signIn } from "@/lib/auth/auth";
 import { prisma } from "@/lib/db/prisma";
 import { loginSchema } from "@/lib/validation/auth";
+import { logger, newCorrelationId } from "@/lib/logging/logger";
 
 export async function loginAction(_prevState: string | undefined, formData: FormData) {
   try {
@@ -28,7 +29,19 @@ export async function loginAction(_prevState: string | undefined, formData: Form
           return "Something went wrong. Please try again.";
       }
     }
-    throw error;
+    // Anything else — most commonly the database being unreachable, or a
+    // missing/invalid AUTH_SECRET — must never surface as a raw,
+    // unhandled 500 (Next.js's generic "This page couldn't load" crash
+    // screen). Logged with a correlation ID and error category only —
+    // never the raw error message, which for a Prisma connection failure
+    // can itself contain the connection string.
+    const correlationId = newCorrelationId();
+    logger.error(
+      "login.unexpected_error",
+      { errorCategory: error instanceof Error ? error.constructor.name : typeof error, path: "/login" },
+      correlationId,
+    );
+    return "Service temporarily unavailable. Please try again shortly.";
   }
 
   // Deliberately re-reads the database rather than calling auth() here:
