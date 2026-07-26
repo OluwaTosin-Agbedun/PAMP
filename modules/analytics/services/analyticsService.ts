@@ -6,7 +6,7 @@ import { PERMISSIONS } from "@/lib/permissions/catalog";
 import { requirePermission } from "@/lib/permissions/service";
 import { getNumericSettingValue } from "@/lib/settings/service";
 
-import { percentage, toCountRecord, zoneForState } from "../domain/analytics";
+import { AGE_BUCKET_ORDER, ageBucketLabel, percentage, toCountRecord, zoneForState } from "../domain/analytics";
 import * as repo from "../repositories/analyticsRepository";
 import type { AnalyticsFiltersInput } from "../validation/schemas";
 
@@ -61,6 +61,8 @@ function shapeApplicationAnalytics(raw: Awaited<ReturnType<typeof repo.getApplic
   const stateCounts: Record<string, number> = {};
   const genderCounts: Record<string, number> = {};
   const submissionByDay: Record<string, number> = {};
+  const ageCounts: Record<string, number> = {};
+  const now = new Date();
   for (const applicant of raw.applicants) {
     const zone = zoneForState(applicant.stateOfOrigin) ?? "Not recorded";
     zoneCounts[zone] = (zoneCounts[zone] ?? 0) + 1;
@@ -70,7 +72,13 @@ function shapeApplicationAnalytics(raw: Awaited<ReturnType<typeof repo.getApplic
     genderCounts[gender] = (genderCounts[gender] ?? 0) + 1;
     const day = applicant.createdAt.toISOString().slice(0, 10);
     submissionByDay[day] = (submissionByDay[day] ?? 0) + 1;
+    const ageBucket = ageBucketLabel(applicant.dateOfBirth, now);
+    if (ageBucket) ageCounts[ageBucket] = (ageCounts[ageBucket] ?? 0) + 1;
   }
+  // Zero-fill every bucket in a fixed order, rather than only the
+  // buckets that happened to have a match — a chart needs every column
+  // present (even at zero) to lay out consistently.
+  const ageDistribution = Object.fromEntries(AGE_BUCKET_ORDER.map((label) => [label, ageCounts[label] ?? 0]));
 
   return {
     total: raw.total,
@@ -82,10 +90,12 @@ function shapeApplicationAnalytics(raw: Awaited<ReturnType<typeof repo.getApplic
     completeVsIncomplete: { complete: raw.submitted, incomplete: raw.total - raw.submitted },
     eligibilityDecisions: toCountRecord(raw.eligibilityGroups.map((g) => ({ key: g.eligibilityStatus, count: g._count._all }))),
     missingDocumentCount: raw.missingDocumentCount,
+    documentCompletionPercent: percentage(raw.documentedCount, raw.total),
     clarificationCases: raw.clarificationCount,
     duplicateFlags: raw.duplicateCount,
     integrityFlags: raw.integrityFlagCount,
     submissionTrendByDay: submissionByDay,
+    ageDistribution,
     pathwayDistribution: toCountRecord(raw.pathwayGroups.map((g) => ({ key: g.pathway, count: g._count._all }))),
     stateDistribution: stateCounts,
     // The count of *distinct* states actually represented (excluding the
@@ -121,6 +131,15 @@ function shapeReviewAnalytics(raw: Awaited<ReturnType<typeof repo.getReviewAnaly
 
   const shortlistCounts = toCountRecord(raw.shortlistGroups.map((g) => ({ key: g.eligibilityStatus, count: g._count._all })));
 
+  const scoreByReviewer = new Map(raw.reviewerScoreGroups.map((g) => [g.reviewerId, g]));
+  const reviewerPerformance = raw.reviewerNames
+    .map((reviewer) => {
+      const group = scoreByReviewer.get(reviewer.id);
+      const avgScore = group?._avg.totalScore != null ? Math.round(Number(group._avg.totalScore) * 100) / 100 : null;
+      return { reviewerId: reviewer.id, name: reviewer.name ?? "Unnamed reviewer", reviewedCount: group?._count._all ?? 0, avgScore };
+    })
+    .sort((a, b) => b.reviewedCount - a.reviewedCount);
+
   return {
     reviewersAssignedCount: raw.reviewersAssignedCount,
     unassignedApplications: raw.unassignedApplications,
@@ -149,12 +168,28 @@ function shapeReviewAnalytics(raw: Awaited<ReturnType<typeof repo.getReviewAnaly
     },
     reviewAverageAcrossCohort:
       raw.scoreStats._avg.reviewAverage != null ? Math.round(Number(raw.scoreStats._avg.reviewAverage) * 100) / 100 : null,
+    // ApplicationScore.compositeScore is this system's actual review +
+    // interview combined figure (calculateCompositeScore, Final Ranking
+    // Engine) — distinct from reviewAverageAcrossCohort above, which is
+    // review-only.
+    avgCombinedScore:
+      raw.scoreStats._avg.compositeScore != null ? Math.round(Number(raw.scoreStats._avg.compositeScore) * 100) / 100 : null,
+    reviewerPerformance,
   };
 }
 
 function shapeInterviewAnalytics(raw: Awaited<ReturnType<typeof repo.getInterviewAnalytics>>) {
   const statusByKey = Object.fromEntries(raw.statusGroups.map((g) => [g.status, g._count._all]));
   const attendanceByKey = Object.fromEntries(raw.attendanceGroups.map((g) => [g.attendanceStatus, g._count._all]));
+
+  // "Success" = a positive outcome (STRONGLY_RECOMMEND or RECOMMEND) out
+  // of every submitted score that recorded a recommendation at all —
+  // RESERVE/NOT_RECOMMENDED/INTEGRITY_HOLD count as the denominator but
+  // not the numerator.
+  const recommendationTotal = raw.recommendationGroups.reduce((sum, g) => sum + g._count._all, 0);
+  const positiveRecommendations = raw.recommendationGroups
+    .filter((g) => g.recommendation === "STRONGLY_RECOMMEND" || g.recommendation === "RECOMMEND")
+    .reduce((sum, g) => sum + g._count._all, 0);
 
   return {
     applicantsShortlisted: raw.shortlisted,
@@ -172,6 +207,7 @@ function shapeInterviewAnalytics(raw: Awaited<ReturnType<typeof repo.getIntervie
     panellistScoreSubmissionCompletionPercent: percentage(raw.scoresSubmitted, raw.scoresExpected),
     averageInterviewScore: raw.avgScore._avg.totalScore != null ? Math.round(Number(raw.avgScore._avg.totalScore) * 100) / 100 : null,
     decisionBands: toCountRecord(raw.recommendationGroups.map((g) => ({ key: g.recommendation, count: g._count._all }))),
+    interviewSuccessRatePercent: percentage(positiveRecommendations, recommendationTotal),
     invitationsSent: raw.invitationsSent,
     remindersScheduledOrDue: raw.remindersSent,
     // §7.3 "Teams meeting creation failures" — `InterviewTeamsMeeting`
@@ -287,6 +323,7 @@ export async function exportAnalyticsCsv(actorId: string, cohortId: string, filt
   const pushSection = (title: string, record: Record<string, unknown>) => {
     lines.push(title);
     for (const [key, value] of Object.entries(record)) {
+      if (Array.isArray(value)) continue; // handled separately per-field (see reviewerPerformance below)
       if (value !== null && typeof value === "object") {
         for (const [subKey, subValue] of Object.entries(value as Record<string, unknown>)) {
           lines.push(`${key}: ${subKey},${subValue}`);
@@ -300,6 +337,12 @@ export async function exportAnalyticsCsv(actorId: string, cohortId: string, filt
 
   pushSection("Application Analytics", dashboard.application);
   pushSection("Review Analytics", dashboard.review);
+  lines.push("Reviewer Performance");
+  lines.push("Reviewer,Reviewed,Avg score given");
+  for (const r of dashboard.review.reviewerPerformance) {
+    lines.push(`${r.name},${r.reviewedCount},${r.avgScore ?? ""}`);
+  }
+  lines.push("");
   pushSection("Interview Analytics", dashboard.interview);
   pushSection("Final Ranking Analytics", dashboard.ranking);
   pushSection("Admission and Offer Analytics", dashboard.admission);

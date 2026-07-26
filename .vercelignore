@@ -1,0 +1,9 @@
+# Defense-in-depth: the CLI's `.gitignore`-respecting behavior isn't
+# guaranteed for every deploy path, and this specifically must never be
+# uploaded outside the normal, reviewed git-based deployment — it holds
+# real applicants' downloaded identity/NYSC/degree documents.
+storage/documents
+storage/reports
+
+node_modules
+.next

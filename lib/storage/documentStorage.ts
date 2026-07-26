@@ -1,10 +1,9 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-const STORAGE_ROOT = path.join(process.cwd(), "storage", "documents");
+import { get, put } from "@vercel/blob";
 
 const EXTENSION_CONTENT_TYPES: Record<string, string> = {
   ".jpg": "image/jpeg",
@@ -38,7 +37,8 @@ export function contentTypeForStorageKey(storageKey: string): string {
  *  write side. Validated again here since the read side (the serving
  *  route) takes it from a URL param, which is attacker-controllable;
  *  this pattern makes path traversal structurally impossible (no `/`
- *  or `..` can match), not just filtered. */
+ *  or `..` can match), not just filtered. Doubles as the Blob store
+ *  pathname. */
 const STORAGE_KEY_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.[a-z0-9]{1,5})?$/i;
 
 export function isInternalStorageKey(key: string): boolean {
@@ -48,12 +48,18 @@ export function isInternalStorageKey(key: string): boolean {
 /**
  * Fetches a document link (typically a short-lived signed URL from the
  * source application portal — some expire within an hour) and persists
- * the bytes to local disk immediately, so the document survives long
- * after the original link expires. Meant to be called at import time,
- * while the link is presumably still fresh. Returns `null` on any
+ * the bytes to a private Vercel Blob store, so the document survives
+ * long after the original link expires. Meant to be called at import
+ * time, while the link is presumably still fresh. Returns `null` on any
  * failure (network error, non-2xx, expired token, empty body) — the
  * caller falls back to keeping the original external link rather than
  * failing the whole row over one bad document.
+ *
+ * Private access (not public) is deliberate: these are applicants' government
+ * ID, NYSC, and degree documents — a real production requirement, not a
+ * preference. Reading a private blob requires BLOB_READ_WRITE_TOKEN,
+ * which only ever runs server-side (see readStoredDocument), never
+ * reaching the client.
  */
 export async function downloadAndStoreDocument(url: string): Promise<{ storageKey: string } | null> {
   try {
@@ -63,8 +69,7 @@ export async function downloadAndStoreDocument(url: string): Promise<{ storageKe
     if (buffer.length === 0) return null;
 
     const storageKey = `${randomUUID()}${extensionFromUrl(url)}`;
-    await mkdir(STORAGE_ROOT, { recursive: true });
-    await writeFile(path.join(STORAGE_ROOT, storageKey), buffer);
+    await put(storageKey, buffer, { access: "private", contentType: contentTypeForStorageKey(storageKey) });
     return { storageKey };
   } catch {
     return null;
@@ -74,7 +79,9 @@ export async function downloadAndStoreDocument(url: string): Promise<{ storageKe
 export async function readStoredDocument(storageKey: string): Promise<Buffer | null> {
   if (!isInternalStorageKey(storageKey)) return null;
   try {
-    return await readFile(path.join(STORAGE_ROOT, storageKey));
+    const result = await get(storageKey, { access: "private" });
+    if (!result) return null;
+    return Buffer.from(await new Response(result.stream).arrayBuffer());
   } catch {
     return null;
   }

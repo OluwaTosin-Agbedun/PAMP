@@ -2,6 +2,7 @@
 
 import { useRef, useState, useTransition } from "react";
 import Link from "next/link";
+import { upload } from "@vercel/blob/client";
 import { CheckCircle2, Upload, XCircle } from "lucide-react";
 import { toast } from "sonner";
 
@@ -37,24 +38,38 @@ export function ImportWizard() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [fileName, setFileName] = useState("");
+  const [pathname, setPathname] = useState("");
   const [headers, setHeaders] = useState<string[]>([]);
   const [previewRows, setPreviewRows] = useState<Record<string, string>[]>([]);
-  const [allRows, setAllRows] = useState<Record<string, string>[]>([]);
+  const [rowCount, setRowCount] = useState(0);
   const [mapping, setMapping] = useState<ColumnMapping>({});
   const [summary, setSummary] = useState<ImportSummary | null>(null);
 
-  function handleParse(formData: FormData) {
+  function handleUpload(file: File) {
     setError(undefined);
     startTransition(async () => {
-      const result = await parseImportFileAction(formData);
+      let blobPathname: string;
+      try {
+        const blob = await upload(file.name, file, {
+          access: "private",
+          handleUploadUrl: "/api/import/blob-upload",
+        });
+        blobPathname = blob.pathname;
+      } catch (uploadError) {
+        setError(uploadError instanceof Error ? uploadError.message : "Upload failed.");
+        return;
+      }
+
+      const result = await parseImportFileAction({ pathname: blobPathname, fileName: file.name });
       if (!result.ok) {
         setError(result.error);
         return;
       }
-      setFileName((formData.get("file") as File).name);
+      setFileName(file.name);
+      setPathname(result.pathname);
       setHeaders(result.headers);
       setPreviewRows(result.previewRows);
-      setAllRows(result.rows);
+      setRowCount(result.rowCount);
       setMapping(result.suggestedMapping);
       setStep("mapping");
     });
@@ -63,7 +78,7 @@ export function ImportWizard() {
   function handleCommit() {
     setError(undefined);
     startTransition(async () => {
-      const result = await commitImportAction({ fileName, columnMapping: mapping, rows: allRows });
+      const result = await commitImportAction({ fileName, pathname, columnMapping: mapping });
       if (!result.ok) {
         setError(result.error);
         return;
@@ -91,7 +106,12 @@ export function ImportWizard() {
             </Alert>
           )}
           <form
-            action={(formData) => handleParse(formData)}
+            onSubmit={(event) => {
+              event.preventDefault();
+              const file = fileInputRef.current?.files?.[0];
+              if (!file) return;
+              handleUpload(file);
+            }}
             className="grid gap-4"
           >
             <input
@@ -104,7 +124,7 @@ export function ImportWizard() {
             />
             <Button type="submit" disabled={isPending} className="w-fit">
               <Upload />
-              {isPending ? "Reading file…" : "Continue"}
+              {isPending ? "Uploading…" : "Continue"}
             </Button>
           </form>
         </CardContent>
@@ -146,7 +166,7 @@ export function ImportWizard() {
           <CardHeader>
             <CardTitle>Map columns</CardTitle>
             <CardDescription>
-              {fileName} — {allRows.length} row{allRows.length === 1 ? "" : "s"}. Unmapped columns
+              {fileName} — {rowCount} row{rowCount === 1 ? "" : "s"}. Unmapped columns
               are kept as additional data on the applicant&apos;s record.
             </CardDescription>
           </CardHeader>
@@ -215,7 +235,7 @@ export function ImportWizard() {
             Back
           </Button>
           <Button onClick={handleCommit} disabled={isPending || duplicates.length > 0}>
-            {isPending ? "Importing…" : `Import ${allRows.length} rows`}
+            {isPending ? "Importing…" : `Import ${rowCount} rows`}
           </Button>
         </div>
       </div>
@@ -265,7 +285,8 @@ export function ImportWizard() {
               setStep("upload");
               setSummary(null);
               setHeaders([]);
-              setAllRows([]);
+              setPathname("");
+              setRowCount(0);
             }}
           >
             Import another file

@@ -52,3 +52,5 @@ next-env.d.ts
 
 # prisma generated client
 /lib/generated/
+
+.claude/

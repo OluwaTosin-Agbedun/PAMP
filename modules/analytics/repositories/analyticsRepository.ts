@@ -70,7 +70,7 @@ export async function getApplicationAnalytics(cohortId: string, filters: Analyti
       prisma.application.groupBy({ by: ["pathway"], where, _count: { _all: true } }),
       prisma.applicant.findMany({
         where: { application: where },
-        select: { gender: true, stateOfOrigin: true, createdAt: true },
+        select: { gender: true, stateOfOrigin: true, createdAt: true, dateOfBirth: true },
       }),
     ]);
 
@@ -81,7 +81,22 @@ export async function getApplicationAnalytics(cohortId: string, filters: Analyti
     where: { status: "FAIL", section: "DOCUMENT", screening: { application: where } },
   });
 
-  return { total, submitted, eligibilityGroups, integrityFlagCount, duplicateCount, clarificationCount, missingDocumentCount, pathwayGroups, applicants };
+  // Applications with at least one re-hosted/linked document — the
+  // "document completion" figure the executive summary card shows.
+  const documentedCount = await prisma.application.count({ where: { ...where, documents: { some: {} } } });
+
+  return {
+    total,
+    submitted,
+    eligibilityGroups,
+    integrityFlagCount,
+    duplicateCount,
+    clarificationCount,
+    missingDocumentCount,
+    documentedCount,
+    pathwayGroups,
+    applicants,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +119,7 @@ export async function getReviewAnalytics(cohortId: string, filters: AnalyticsFil
     conflictCount,
     scoreStats,
     shortlistGroups,
+    reviewerScoreGroups,
   ] = await Promise.all([
     prisma.reviewAssignment.groupBy({ by: ["reviewerId"], where: { ...assignmentWhere, status: { not: "CANCELLED" } } }),
     prisma.application.count({ where: { ...applicationWhere, reviewAssignments: { none: {} } } }),
@@ -114,9 +130,30 @@ export async function getReviewAnalytics(cohortId: string, filters: AnalyticsFil
     }),
     prisma.reviewEscalation.count({ where: { application: applicationWhere } }),
     prisma.review.count({ where: { application: applicationWhere, conflictOfInterest: true } }),
-    prisma.applicationScore.aggregate({ where: { application: applicationWhere }, _avg: { reviewAverage: true }, _count: { reviewAverage: true } }),
+    prisma.applicationScore.aggregate({
+      where: { application: applicationWhere },
+      _avg: { reviewAverage: true, compositeScore: true },
+      _count: { reviewAverage: true },
+    }),
     prisma.application.groupBy({ by: ["eligibilityStatus"], where: applicationWhere, _count: { _all: true } }),
+    // Per-reviewer breakdown (Reviewer Performance) — submitted reviews
+    // only, since an in-progress review's totalScore isn't final yet.
+    prisma.review.groupBy({
+      by: ["reviewerId"],
+      where: { application: applicationWhere, status: "SUBMITTED" },
+      _count: { _all: true },
+      _avg: { totalScore: true },
+    }),
   ]);
+
+  // Every reviewer with a live assignment in scope, not just ones who've
+  // submitted at least one review — a reviewer sitting at zero (like a
+  // brand-new addition to the pool) is a real, meaningful row, not an
+  // absence to silently drop.
+  const reviewerIds = [...new Set(reviewersAssigned.map((r) => r.reviewerId))];
+  const reviewerNames = reviewerIds.length
+    ? await prisma.user.findMany({ where: { id: { in: reviewerIds } }, select: { id: true, name: true } })
+    : [];
 
   return {
     reviewersAssignedCount: reviewersAssigned.length,
@@ -127,6 +164,8 @@ export async function getReviewAnalytics(cohortId: string, filters: AnalyticsFil
     conflictCount,
     scoreStats,
     shortlistGroups,
+    reviewerScoreGroups,
+    reviewerNames,
   };
 }
 

@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { getActiveCohort } from "@/lib/cohort";
 import { PERMISSIONS } from "@/lib/permissions/catalog";
 import { requirePagePermission } from "@/lib/permissions/guard";
@@ -10,7 +12,26 @@ import { analyticsFiltersSchema } from "@/modules/analytics/validation/schemas";
 
 import { MetricCard } from "../review-operations/metric-card";
 import { AnalyticsFilterBar } from "./filter-bar";
+import { DonutChart } from "./donut-chart";
 import { ExportAnalyticsButton } from "./export-button";
+
+/** A labelled horizontal bar list — Pathway Breakdown, Age Distribution, and the Selection Funnel all share this same shape, just with a different value set. */
+function BarList({ entries, maxOverride }: { entries: { label: string; value: number }[]; maxOverride?: number }) {
+  const max = maxOverride ?? Math.max(1, ...entries.map((e) => e.value));
+  return (
+    <ul className="grid gap-3">
+      {entries.map((entry) => (
+        <li key={entry.label} className="grid gap-1">
+          <div className="flex justify-between text-sm">
+            <span className="text-muted-foreground">{entry.label}</span>
+            <span className="font-medium">{entry.value}</span>
+          </div>
+          <Progress value={(entry.value / max) * 100} label={entry.label} />
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 export const metadata: Metadata = {
   title: "Reports — PAM-P FMS",
@@ -66,6 +87,16 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
 
   const canExport = permissionsForRole(user.role).includes(PERMISSIONS.REPORTS_EXPORT);
 
+  const genderSegments = Object.entries(dashboard.application.genderDistribution).map(([label, value]) => ({ label, value }));
+  const pathwayEntries = Object.entries(dashboard.application.pathwayDistribution).map(([label, value]) => ({ label, value }));
+  const ageEntries = Object.entries(dashboard.application.ageDistribution).map(([label, value]) => ({ label, value }));
+  const funnelEntries = [
+    { label: "Received", value: dashboard.application.total },
+    { label: "Eligible", value: dashboard.application.eligibilityDecisions.ELIGIBLE ?? 0 },
+    { label: "Reviewed", value: dashboard.review.reviewsSubmitted },
+    { label: "Interviewed", value: dashboard.interview.interviewsCompleted },
+  ];
+
   return (
     <div className="grid gap-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -77,6 +108,82 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
       </div>
 
       <AnalyticsFilterBar reviewers={filterOptions.reviewers} panellists={filterOptions.panellists} />
+
+      <div>
+        <h2 className="mb-3 text-lg font-semibold tracking-tight">Executive Summary</h2>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <MetricCard label="Applications" value={dashboard.application.total} />
+          <MetricCard label="Document completion" value={`${dashboard.application.documentCompletionPercent}%`} />
+          <MetricCard label="Avg. combined score" value={dashboard.review.avgCombinedScore ?? "—"} />
+          <MetricCard label="Interview success rate" value={`${dashboard.interview.interviewSuccessRatePercent}%`} />
+        </div>
+
+        <div className="mt-4 grid gap-4 lg:grid-cols-2">
+          <Card>
+            <CardHeader><CardTitle className="text-base">Gender Distribution</CardTitle></CardHeader>
+            <CardContent>
+              {genderSegments.length > 0 ? (
+                <DonutChart segments={genderSegments} />
+              ) : (
+                <p className="text-muted-foreground text-sm">No applicants recorded yet.</p>
+              )}
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader><CardTitle className="text-base">Programme Pathway Breakdown</CardTitle></CardHeader>
+            <CardContent>
+              {pathwayEntries.length > 0 ? (
+                <BarList entries={pathwayEntries} />
+              ) : (
+                <p className="text-muted-foreground text-sm">No applicants recorded yet.</p>
+              )}
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader><CardTitle className="text-base">Age Distribution</CardTitle></CardHeader>
+            <CardContent><BarList entries={ageEntries} /></CardContent>
+          </Card>
+          <Card>
+            <CardHeader><CardTitle className="text-base">Reviewer Performance</CardTitle></CardHeader>
+            <CardContent>
+              {dashboard.review.reviewerPerformance.length > 0 ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Reviewer</TableHead>
+                      <TableHead>Reviewed</TableHead>
+                      <TableHead>Avg score given</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {dashboard.review.reviewerPerformance.map((reviewer) => (
+                      <TableRow key={reviewer.reviewerId}>
+                        <TableCell>{reviewer.name}</TableCell>
+                        <TableCell>{reviewer.reviewedCount}</TableCell>
+                        <TableCell>{reviewer.avgScore ?? "—"}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <p className="text-muted-foreground text-sm">No reviewers assigned yet.</p>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="mt-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Selection Funnel &amp; Acceptance Rate</CardTitle>
+              <CardDescription>{dashboard.admission.acceptanceRatePercent}% acceptance rate (of offers issued)</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <BarList entries={funnelEntries} maxOverride={Math.max(1, dashboard.application.total)} />
+            </CardContent>
+          </Card>
+        </div>
+      </div>
 
       <div>
         <h2 className="mb-3 text-lg font-semibold tracking-tight">Application Analytics</h2>

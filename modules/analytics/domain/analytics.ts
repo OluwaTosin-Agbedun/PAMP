@@ -85,6 +85,36 @@ export function percentage(numerator: number, denominator: number): number {
   return Math.round((numerator / denominator) * 1000) / 10;
 }
 
+/** Standard 5-year demographic bins — no PAM-P-specific age eligibility rule exists in the schema to derive bucket edges from instead. */
+const AGE_BUCKETS = [
+  { label: "20–24", min: 20, max: 24 },
+  { label: "25–29", min: 25, max: 29 },
+  { label: "30–34", min: 30, max: 34 },
+  { label: "35–39", min: 35, max: 39 },
+  { label: "40+", min: 40, max: Infinity },
+] as const;
+
+/** Whole years as of `asOf`, the same "count completed birthdays" definition used everywhere else age matters (e.g. NYSC eligibility). */
+function ageInYears(dateOfBirth: Date, asOf: Date): number {
+  let age = asOf.getUTCFullYear() - dateOfBirth.getUTCFullYear();
+  const hasHadBirthdayThisYear =
+    asOf.getUTCMonth() > dateOfBirth.getUTCMonth() ||
+    (asOf.getUTCMonth() === dateOfBirth.getUTCMonth() && asOf.getUTCDate() >= dateOfBirth.getUTCDate());
+  if (!hasHadBirthdayThisYear) age--;
+  return age;
+}
+
+/** Bucket label for one applicant's age, or null for "under 20"/unrecorded — never forced into a nearest bucket, since a bad import value shouldn't silently masquerade as a real 20-year-old. */
+export function ageBucketLabel(dateOfBirth: Date | null, asOf: Date): string | null {
+  if (!dateOfBirth) return null;
+  const age = ageInYears(dateOfBirth, asOf);
+  const bucket = AGE_BUCKETS.find((b) => age >= b.min && age <= b.max);
+  return bucket?.label ?? null;
+}
+
+/** Fixed left-to-right ordering for rendering — `Object.entries` on a count record has no guaranteed bucket order otherwise. */
+export const AGE_BUCKET_ORDER = AGE_BUCKETS.map((b) => b.label);
+
 /** One row per calendar day (UTC) between two dates the submission-trend chart needs, even for days with zero submissions. */
 export function dateRangeDays(from: Date, to: Date): string[] {
   const days: string[] = [];
